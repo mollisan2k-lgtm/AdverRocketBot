@@ -85,3 +85,16 @@ class GroupRepository(BaseRepository[SellerGroup]):
             .where(SellerGroup.user_id == user_id)
         )
         return result.scalar_one()
+
+    async def get_active_members(self, group_id: int) -> list[int]:
+        """Get Telegram IDs of active members in a group."""
+        from app.db.models import SellerGroupMember
+        result = await self.session.execute(
+            select(SellerGroupMember.user_telegram_id)
+            .where(
+                SellerGroupMember.group_id == group_id,
+                SellerGroupMember.is_member == True,
+                SellerGroupMember.status == "member"
+            )
+        )
+        return list(result.scalars().all())

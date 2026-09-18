@@ -5,6 +5,7 @@ Buyer handlers: campaign creation wizard, deposit, campaign management.
 from __future__ import annotations
 
 import logging
+import html
 from decimal import Decimal
 
 from aiogram import Router, F
@@ -115,14 +116,14 @@ async def cb_campaign_draft_resume(
                 # Need to re-ask count to show confirmation with fresh balance
                 await state.set_state(CampaignCreation.entering_target_count)
                 await callback.message.edit_text(
-                    f"✅ <b>{data.get('target_title')}</b>\n\n"
+                    f"✅ <b>{html.escape(str(data.get('target_title', '')))}</b>\n\n"
                     "🎯 Сколько подписчиков вы хотите получить?\n"
                     "Введите число (мин. 10):"
                 )
             elif "target_link" in data:
                 await state.set_state(CampaignCreation.entering_target_count)
                 await callback.message.edit_text(
-                    f"✅ <b>{data.get('target_title')}</b>\n\n"
+                    f"✅ <b>{html.escape(str(data.get('target_title', '')))}</b>\n\n"
                     "🎯 Сколько подписчиков вы хотите получить?\n"
                     "Введите число (мин. 10):"
                 )
@@ -142,7 +143,7 @@ async def cb_campaign_draft_resume(
                 kb.button(text="◀️ Назад", callback_data="campaign:create")
                 kb.adjust(2, 1)
                 await callback.message.edit_text(
-                    f"📂 Категория: <b>{data.get('category_name')}</b>\n\n"
+                    f"📂 Категория: <b>{html.escape(str(data.get('category_name', '')))}</b>\n\n"
                     "Выберите тип объекта для продвижения:",
                     reply_markup=kb.as_markup()
                 )
@@ -231,7 +232,7 @@ async def cb_campaign_cat_chosen(
     kb.adjust(2, 1)
 
     await callback.message.edit_text(
-        f"📂 Категория: <b>{category.name}</b>\n\n"
+        f"📂 Категория: <b>{html.escape(str(category.name))}</b>\n\n"
         "Выберите тип объекта для продвижения:",
         reply_markup=kb.as_markup(),
     )
@@ -302,7 +303,7 @@ async def msg_campaign_target_link(
         await draft_repo.upsert(user.id, data)
 
     await message.answer(
-        f"✅ <b>{target_info.target_title}</b>\n\n"
+        f"✅ <b>{html.escape(str(target_info.target_title))}</b>\n\n"
         "🎯 Сколько подписчиков вы хотите получить?\n"
         "Введите число (мин. 10):",
     )
@@ -508,7 +509,7 @@ async def cb_campaign_view(callback: CallbackQuery, session: AsyncSession) -> No
     remaining = total_cost - spent
 
     text = (
-        f"📌 <b>{campaign.target_title_snapshot}</b>\n\n"
+        f"📌 <b>{html.escape(str(campaign.target_title_snapshot))}</b>\n\n"
         f"📂 Категория: {campaign.category_name_snapshot}\n"
         f"🎯 Прогресс: <b>{campaign.completed}/{campaign.target}</b>\n"
         f"💰 Потрачено: {format_amount_plain(spent)} USDT\n"
@@ -739,7 +740,7 @@ async def cb_campaign_increase(
     await state.update_data(campaign_id=campaign_id, buyer_price=str(buyer_price))
     await callback.message.edit_text(
         f"🎯 <b>Увеличение цели кампании</b>\n\n"
-        f"📌 {campaign.target_title_snapshot}\n"
+        f"📌 {html.escape(str(campaign.target_title_snapshot))}\n"
         f"Текущая цель: {campaign.target} подписчиков\n"
         f"Выполнено: {campaign.completed}\n"
         f"Осталось: {remaining}\n"
@@ -855,7 +856,7 @@ async def cb_campaign_increase_confirm(
 
     await callback.message.edit_text(
         f"✅ Цель кампании увеличена!\n\n"
-        f"📌 {campaign.target_title_snapshot}\n"
+        f"📌 {html.escape(str(campaign.target_title_snapshot))}\n"
         f"🎯 Новая цель: {campaign.target} подписчиков\n"
         f"💵 Зарезервировано: {format_amount_plain(extra_cost)} USDT",
     )
@@ -899,21 +900,24 @@ async def msg_deposit_amount(
 
     deposit_service = DepositService(session, crypto_pay)
     try:
-        deposit = await deposit_service.create_deposit(user.id, amount)
+        from app.db.engine import run_atomic
+        
+        async def _create(s: AsyncSession):
+            ds = DepositService(s, crypto_pay)
+            return await ds.create_deposit(user.id, amount)
+            
+        deposit = await run_atomic(_create)
     except Exception as e:
         await message.answer(f"❌ Ошибка создания платежа: {e}")
         await state.clear()
         return
 
     kb = InlineKeyboardBuilder()
-    if deposit.pay_url:
-        kb.button(text="💳 Оплатить", url=deposit.pay_url)
     kb.button(text="◀️ Меню", callback_data="main_menu")
-    kb.adjust(1)
-
-    text_repo = TextRepository(session)
-    tpl = await text_repo.get_text("deposit_created")
-    text = tpl.format(amount=format_amount_plain(amount))
-
-    await message.answer(text, reply_markup=kb.as_markup())
+    
+    await message.answer(
+        f"⏳ Запрос на пополнение <b>{format_amount_plain(amount)} USDT</b> принят.\n\n"
+        "Счет формируется, ожидайте уведомления с ссылкой на оплату в течение минуты.",
+        reply_markup=kb.as_markup()
+    )
     await state.clear()

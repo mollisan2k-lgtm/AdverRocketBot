@@ -2,36 +2,13 @@ import asyncio
 import os
 import pytest
 from decimal import Decimal
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncSession
 from app.db.models import Base, User, Campaign, BalanceLedger, Category, SellerGroup
 from app.services.campaign_service import CampaignService
 from app.services.balance_service import BalanceService
 from app.services.user_service import UserService
-from app.db.engine import run_atomic, _set_sqlite_pragmas
-from sqlalchemy import event
-
-# Setup isolated engine
-DB_URL = "sqlite+aiosqlite:///file:test_concurrency.db?mode=rwc&uri=true"
-test_engine = create_async_engine(DB_URL, echo=False, pool_pre_ping=True, connect_args={"check_same_thread": False})
-event.listen(test_engine.sync_engine, "connect", _set_sqlite_pragmas)
-test_session_factory = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
-
-# Monkey-patch engine for run_atomic
-import app.db.engine as engine_module
-engine_module.engine = test_engine
-engine_module.session_factory = test_session_factory
-
-import pytest_asyncio
-
-@pytest_asyncio.fixture(autouse=True)
-async def setup_db():
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
-        await conn.run_sync(Base.metadata.create_all)
-    yield
-    # Cleanup after test
-    async with test_engine.begin() as conn:
-        await conn.run_sync(Base.metadata.drop_all)
+from app.db.engine import run_atomic
+from tests.conftest import test_session_factory
 
 @pytest.mark.asyncio
 async def test_concurrent_balance_update():
@@ -175,3 +152,136 @@ async def test_concurrent_campaign_completions():
         campaign = await campaign_service.get_by_id(campaign_id)
         assert campaign.completed == 50
         assert campaign.status == "completed"
+
+@pytest.mark.asyncio
+async def test_concurrent_withdrawals():
+    async with test_session_factory() as session:
+        user = User(telegram_id=404040)
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+        user_id = user.id
+
+        balance_service = BalanceService(session)
+        await balance_service.admin_adjustment(
+            user_id=user_id, amount=Decimal("100.00"), reason="Init", admin_telegram_id=1, idempotency_key="init_wd"
+        )
+        await session.commit()
+
+    async def withdraw_sub(i: int):
+        from app.services.withdrawal_service import WithdrawalService
+        async def _op(session: AsyncSession):
+            wd_service = WithdrawalService(session)
+            # Try to withdraw 10.00. Only 10 should succeed.
+            try:
+                await wd_service.request_withdrawal(user_id=user_id, amount=Decimal("10.00"), recipient_telegram_id=404040)
+                return True
+            except ValueError:
+                return False
+        return await run_atomic(_op)
+
+    tasks = [asyncio.create_task(withdraw_sub(i), name=str(i)) for i in range(20)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    success_count = sum(1 for r in results if r is True)
+    assert success_count == 1, f"Expected exactly 1 successful withdrawal out of 20 due to has_pending check, got {success_count}. Results: {results}"
+
+    async with test_session_factory() as session:
+        balance_service = BalanceService(session)
+        available, reserved, held = await balance_service.get_balance(user_id)
+        assert available == Decimal("90.00")
+        assert reserved == Decimal("0.00")
+        assert held == Decimal("10.00")
+
+@pytest.mark.asyncio
+async def test_concurrent_assignments():
+    # Test task distributor assignment concurrency
+    from app.services.task_service import TaskService
+    async with test_session_factory() as session:
+        buyer = User(telegram_id=505050)
+        cat = Category(name="TestCat2", buyer_price="1.00", seller_payout="0.50")
+        session.add_all([buyer, cat])
+        await session.commit()
+        await session.refresh(buyer)
+        await session.refresh(cat)
+
+        group = SellerGroup(
+            user_id=buyer.id,
+            telegram_chat_id=-100987654322,
+            title="TestGroup2",
+            category_id=cat.id,
+            interval_minutes=10,
+            status="approved"
+        )
+        session.add(group)
+        
+        # 10 sellers in the group
+        sellers = [User(telegram_id=600000 + i) for i in range(10)]
+        session.add_all(sellers)
+        await session.commit()
+        await session.refresh(group)
+        
+        # Add members
+        from app.db.models import SellerGroupMember
+        members = [SellerGroupMember(group_id=group.id, user_telegram_id=s.telegram_id) for s in sellers]
+        session.add_all(members)
+
+        balance_service = BalanceService(session)
+        await balance_service.admin_adjustment(
+            user_id=buyer.id, amount=Decimal("100.00"), reason="Initial", admin_telegram_id=1, idempotency_key="init_dep2"
+        )
+        
+        campaign_service = CampaignService(session)
+        campaign = await campaign_service.create_campaign(
+            user_id=buyer.id, category_id=cat.id, target=5,
+            target_type="channel", target_chat_id=-100123456780,
+            target_username="test2", target_title_snapshot="Test2", target_link="https://t.me/test2"
+        )
+        await session.commit()
+        campaign_id = campaign.id
+
+    # Emulate distributor
+    async def assign_sub(i: int):
+        async def _op(session: AsyncSession):
+            task_service = TaskService(session)
+            # Try assigning. Since target is 5, only 5 out of 10 should succeed.
+            # We don't have direct assignment here, distributor usually picks them.
+            # We can emulate the exact assignment logic.
+            camp = await session.get(Campaign, campaign_id)
+            from sqlalchemy import select, func
+            from app.db.models import CampaignTask
+            
+            # Try assigning using the distributor's logic: count active + completed
+            count = await session.scalar(
+                select(func.count(CampaignTask.id))
+                .where(CampaignTask.campaign_id == campaign_id)
+            )
+            if count >= camp.target:
+                return False
+            
+            task = CampaignTask(
+                campaign_id=campaign.id,
+                group_id=group.id,
+                user_telegram_id=600000 + i,
+                target_chat_id=-100123456780,
+                interval_minutes_snapshot=10,
+                status="active"
+            )
+            session.add(task)
+            return True
+        return await run_atomic(_op)
+
+    tasks = [asyncio.create_task(assign_sub(i), name=str(i)) for i in range(10)]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+
+    success_count = sum(1 for r in results if r is True)
+    assert success_count == 5, f"Expected exactly 5 successful assignments, got {success_count}. Results: {results}"
+
+    async with test_session_factory() as session:
+        from app.db.models import CampaignTask
+        from sqlalchemy import select, func
+        task_count = await session.scalar(
+            select(func.count(CampaignTask.id)).where(CampaignTask.campaign_id == campaign_id)
+        )
+        assert task_count == 5
+

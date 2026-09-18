@@ -5,6 +5,7 @@ Admin handlers: admin panel, moderation, settings, monitoring.
 from __future__ import annotations
 
 import logging
+import html
 from decimal import Decimal
 
 from aiogram import Router, F
@@ -194,21 +195,25 @@ async def cb_admin_wd_approve(
         return
 
     wd_id = int(callback.data.split(":")[2])
-    wd_service = WithdrawalService(session, crypto_pay)
+    from app.db.engine import run_atomic
 
-    ok = await wd_service.approve(wd_id)
+    async def _approve(s: AsyncSession) -> bool:
+        wd_service = WithdrawalService(s, crypto_pay)
+        ok = await wd_service.approve(wd_id)
+        if ok:
+            audit_repo = AuditLogRepository(s)
+            await audit_repo.log_action(
+                actor_telegram_id=callback.from_user.id,
+                action="withdrawal_approved",
+                object_type="withdrawal",
+                object_id=wd_id,
+            )
+        return ok
+
+    ok = await run_atomic(_approve)
     if not ok:
         await callback.answer("Не удалось одобрить.", show_alert=True)
         return
-
-    # Audit log
-    audit_repo = AuditLogRepository(session)
-    await audit_repo.log_action(
-        actor_telegram_id=callback.from_user.id,
-        action="withdrawal_approved",
-        object_type="withdrawal",
-        object_id=wd_id,
-    )
 
     await callback.answer("✅ Вывод одобрен")
     await cb_admin_withdrawals(callback, session)
@@ -221,18 +226,22 @@ async def cb_admin_wd_reject(callback: CallbackQuery, session: AsyncSession) -> 
         return
 
     wd_id = int(callback.data.split(":")[2])
-    wd_service = WithdrawalService(session)
-    ok = await wd_service.reject(wd_id, "Отклонено администратором")
+    from app.db.engine import run_atomic
 
-    if ok:
-        audit_repo = AuditLogRepository(session)
-        await audit_repo.log_action(
-            actor_telegram_id=callback.from_user.id,
-            action="withdrawal_rejected",
-            object_type="withdrawal",
-            object_id=wd_id,
-        )
+    async def _reject(s: AsyncSession) -> bool:
+        wd_service = WithdrawalService(s)
+        ok = await wd_service.reject(wd_id, "Отклонено администратором")
+        if ok:
+            audit_repo = AuditLogRepository(s)
+            await audit_repo.log_action(
+                actor_telegram_id=callback.from_user.id,
+                action="withdrawal_rejected",
+                object_type="withdrawal",
+                object_id=wd_id,
+            )
+        return ok
 
+    ok = await run_atomic(_reject)
     await callback.answer("❌ Вывод отклонён" if ok else "Ошибка")
     await cb_admin_withdrawals(callback, session)
 
@@ -300,7 +309,7 @@ async def cb_admin_group_mod(
         return
 
     text = (
-        f"👥 <b>{group.title or group.telegram_chat_id}</b>\n\n"
+        f"👥 <b>{html.escape(str(group.title or group.telegram_chat_id))}</b>\n\n"
         f"ID чата: <code>{group.telegram_chat_id}</code>\n"
         f"Участники: {group.member_count or '?'}\n"
         f"Категория: {group.category.name if group.category else '?'}\n"
@@ -326,18 +335,22 @@ async def cb_admin_group_approve(
         return
 
     group_id = int(callback.data.split(":")[2])
-    group_service = GroupService(session, telegram_api)
-    ok = await group_service.approve(group_id)
+    from app.db.engine import run_atomic
 
-    if ok:
-        audit_repo = AuditLogRepository(session)
-        await audit_repo.log_action(
-            actor_telegram_id=callback.from_user.id,
-            action="group_approved",
-            object_type="seller_group",
-            object_id=group_id,
-        )
+    async def _approve(s: AsyncSession) -> bool:
+        group_service = GroupService(s, telegram_api)
+        ok = await group_service.approve(group_id)
+        if ok:
+            audit_repo = AuditLogRepository(s)
+            await audit_repo.log_action(
+                actor_telegram_id=callback.from_user.id,
+                action="group_approved",
+                object_type="seller_group",
+                object_id=group_id,
+            )
+        return ok
 
+    ok = await run_atomic(_approve)
     await callback.answer("✅ Группа одобрена" if ok else "Ошибка")
     await cb_admin_moderation(callback, session, telegram_api)
 
@@ -351,18 +364,22 @@ async def cb_admin_group_reject(
         return
 
     group_id = int(callback.data.split(":")[2])
-    group_service = GroupService(session, telegram_api)
-    ok = await group_service.reject(group_id, "Отклонено администратором")
+    from app.db.engine import run_atomic
 
-    if ok:
-        audit_repo = AuditLogRepository(session)
-        await audit_repo.log_action(
-            actor_telegram_id=callback.from_user.id,
-            action="group_rejected",
-            object_type="seller_group",
-            object_id=group_id,
-        )
+    async def _reject(s: AsyncSession) -> bool:
+        group_service = GroupService(s, telegram_api)
+        ok = await group_service.reject(group_id, "Отклонено администратором")
+        if ok:
+            audit_repo = AuditLogRepository(s)
+            await audit_repo.log_action(
+                actor_telegram_id=callback.from_user.id,
+                action="group_rejected",
+                object_type="seller_group",
+                object_id=group_id,
+            )
+        return ok
 
+    ok = await run_atomic(_reject)
     await callback.answer("❌ Группа отклонена" if ok else "Ошибка")
     await cb_admin_moderation(callback, session, telegram_api)
 
@@ -471,13 +488,17 @@ async def msg_cat_seller_payout(
     data = await state.get_data()
     buyer_price = Decimal(data["buyer_price"])
 
-    cat_service = CategoryService(session)
-    try:
-        category = await cat_service.create(
+    from app.db.engine import run_atomic
+    async def _create_cat(s: AsyncSession):
+        cat_service = CategoryService(s)
+        return await cat_service.create(
             name=data["name"],
             buyer_price=buyer_price,
             seller_payout=payout,
         )
+
+    try:
+        category = await run_atomic(_create_cat)
     except ValueError as e:
         await message.answer(f"❌ {e}")
         return
@@ -496,7 +517,7 @@ async def msg_cat_seller_payout(
     )
 
     await message.answer(
-        f"✅ Категория <b>{category.name}</b> создана.\n\n"
+        f"✅ Категория <b>{html.escape(str(category.name))}</b> создана.\n\n"
         f"Покупка: {format_amount_plain(buyer_price)} USDT\n"
         f"Выплата: {format_amount_plain(payout)} USDT"
     )
@@ -545,20 +566,22 @@ async def cb_admin_cat_status(callback: CallbackQuery, session: AsyncSession) ->
 
     from sqlalchemy import update
     from app.db.models import Category
+    from app.db.engine import run_atomic
 
-    await session.execute(
-        update(Category)
-        .where(Category.id == cat_id)
-        .values(status=new_status)
-    )
-    await session.commit()
+    async def _update_status(s: AsyncSession):
+        await s.execute(
+            update(Category)
+            .where(Category.id == cat_id)
+            .values(status=new_status)
+        )
+
+    await run_atomic(_update_status)
     await callback.answer(f"Статус изменен на {new_status}")
     
     # Refresh category view
     new_callback_data = f"admin:cat_edit:{cat_id}"
     callback_mock = callback.model_copy(update={"data": new_callback_data})
     await cb_admin_cat_edit(callback_mock, session)
-    await state.clear()
 
 
 # ── System errors ────────────────────────────────────────────────────────────
@@ -609,8 +632,13 @@ async def cb_admin_error_resolve(
         return
 
     error_id = int(callback.data.split(":")[2])
-    error_repo = SystemErrorRepository(session)
-    ok = await error_repo.resolve(error_id)
+    from app.db.engine import run_atomic
+    
+    async def _resolve(s: AsyncSession) -> bool:
+        error_repo = SystemErrorRepository(s)
+        return await error_repo.resolve(error_id)
+        
+    ok = await run_atomic(_resolve)
     await callback.answer("✅ Resolved" if ok else "Не найдена")
     await cb_admin_errors(callback, session)
 
@@ -696,17 +724,22 @@ async def msg_admin_set_edit_value(message: Message, session: AsyncSession, stat
         await message.answer(f"❌ Ошибка валидации: {e}. Попробуйте снова:")
         return
 
-    await settings_repo.set_value(key, new_val)
-    
-    audit_repo = AuditLogRepository(session)
-    await audit_repo.log_action(
-        actor_telegram_id=message.from_user.id,
-        action="setting_changed",
-        object_type="setting",
-        object_id=0,
-        new_value={"key": key, "value": new_val},
-    )
+    from app.db.engine import run_atomic
 
+    async def _save_setting(s: AsyncSession):
+        settings_repo = SettingsRepository(s)
+        await settings_repo.set_value(key, new_val)
+        
+        audit_repo = AuditLogRepository(s)
+        await audit_repo.log_action(
+            actor_telegram_id=message.from_user.id,
+            action="setting_changed",
+            object_type="setting",
+            object_id=0,
+            new_value={"key": key, "value": new_val},
+        )
+
+    await run_atomic(_save_setting)
     await state.clear()
     
     kb = InlineKeyboardBuilder()
@@ -774,8 +807,14 @@ async def cb_admin_text_reset(callback: CallbackQuery, session: AsyncSession) ->
     bt = result.scalar_one_or_none()
     
     if bt:
-        bt.text = bt.default_text
-        await session.commit()
+        from app.db.engine import run_atomic
+        async def _op(s: AsyncSession):
+            import app.db.models as models
+            local_bt = await s.get(models.BotText, bt.id)
+            if local_bt:
+                local_bt.text = local_bt.default_text
+        await run_atomic(_op)
+        
         await callback.answer("✅ Текст сброшен на стандартный")
     else:
         await callback.answer("Текст не найден", show_alert=True)

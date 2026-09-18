@@ -15,7 +15,7 @@ MOSCOW_TZ = timezone(timedelta(hours=3))
 
 def utc_now() -> datetime:
     """Current UTC time (timezone-naive for SQLite compatibility)."""
-    return datetime.utcnow()
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
 def to_moscow(dt: datetime | None) -> datetime | None:

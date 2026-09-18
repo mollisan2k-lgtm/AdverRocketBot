@@ -105,26 +105,77 @@ class WithdrawalRepository(BaseRepository[Withdrawal]):
         )
         return result.scalar_one()
 
-    async def claim_for_processing(self, worker_token: str, lease_minutes: int = 5) -> Sequence[Withdrawal]:
+    async def claim_for_processing(self, worker_id: str, claim_token: str, limit: int = 5) -> Sequence[Withdrawal]:
         """
         Claim unassigned or expired-lease withdrawals for processing.
         MUST be called inside run_atomic.
         """
         now = utc_now()
-        lease_expiry = now + timedelta(minutes=lease_minutes)
+        lease_expiry = now + timedelta(minutes=5)
         
         result = await self.session.execute(
             select(Withdrawal)
             .where(
                 Withdrawal.status.in_(["approved", "processing"]),
-                (Withdrawal.lease_expires_at == None) | (Withdrawal.lease_expires_at <= now)
+                ((Withdrawal.lease_expires_at.is_(None)) | (Withdrawal.lease_expires_at <= now))
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        withdrawals = list(result.scalars().all())
+        if not withdrawals:
+            return []
+            
+        ids = [w.id for w in withdrawals]
+        await self.session.execute(
+            update(Withdrawal)
+            .where(Withdrawal.id.in_(ids))
+            .values(
+                worker_id=worker_id,
+                claim_token=claim_token,
+                lease_expires_at=lease_expiry,
+                status="processing",
+                updated_at=now,
+                generation=Withdrawal.generation + 1
             )
         )
-        withdrawals = result.scalars().all()
-        for w in withdrawals:
-            w.worker_token = worker_token
-            w.lease_expires_at = lease_expiry
-            w.status = "processing"
-            w.updated_at = now
             
-        return withdrawals
+        res = await self.session.execute(select(Withdrawal).where(Withdrawal.id.in_(ids)))
+        return list(res.scalars().all())
+
+    async def claim_for_reconciliation(self, worker_id: str, claim_token: str, limit: int = 5) -> Sequence[Withdrawal]:
+        """
+        Claim withdrawals stuck in reconciliation_required.
+        MUST be called inside run_atomic.
+        """
+        now = utc_now()
+        lease_expiry = now + timedelta(minutes=5)
+        
+        result = await self.session.execute(
+            select(Withdrawal)
+            .where(
+                Withdrawal.status == "reconciliation_required",
+                ((Withdrawal.lease_expires_at.is_(None)) | (Withdrawal.lease_expires_at <= now))
+            )
+            .limit(limit)
+            .with_for_update(skip_locked=True)
+        )
+        withdrawals = list(result.scalars().all())
+        if not withdrawals:
+            return []
+            
+        ids = [w.id for w in withdrawals]
+        await self.session.execute(
+            update(Withdrawal)
+            .where(Withdrawal.id.in_(ids))
+            .values(
+                worker_id=worker_id,
+                claim_token=claim_token,
+                lease_expires_at=lease_expiry,
+                updated_at=now,
+                generation=Withdrawal.generation + 1
+            )
+        )
+            
+        res = await self.session.execute(select(Withdrawal).where(Withdrawal.id.in_(ids)))
+        return list(res.scalars().all())

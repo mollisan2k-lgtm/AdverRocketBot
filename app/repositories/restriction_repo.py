@@ -101,25 +101,39 @@ class RestrictionRepository(BaseRepository[UserRestriction]):
         )
         return list(result.scalars().all())
 
-    async def claim_for_reconciliation(self, worker_token: str, lease_minutes: int = 5) -> Sequence[UserRestriction]:
+    async def claim_for_reconciliation(self, worker_id: str, claim_token: str, limit: int = 50) -> Sequence[UserRestriction]:
         """
         Claim records where desired_state != actual_state for background processing.
         MUST be called inside run_atomic.
         """
+        from sqlalchemy import update
         now = utc_now()
-        lease_expiry = now + timedelta(minutes=lease_minutes)
+        lease_expiry = now + timedelta(minutes=2)
         
         result = await self.session.execute(
             select(UserRestriction)
             .where(
                 UserRestriction.desired_state != UserRestriction.actual_state,
-                (UserRestriction.lease_expires_at == None) | (UserRestriction.lease_expires_at <= now)
+                ((UserRestriction.lease_expires_at.is_(None)) | (UserRestriction.lease_expires_at <= now))
             )
-            .limit(100) # Process in batches
+            .limit(limit)
+            .with_for_update(skip_locked=True)
         )
-        restrictions = result.scalars().all()
-        for r in restrictions:
-            r.worker_token = worker_token
-            r.lease_expires_at = lease_expiry
+        restrictions = list(result.scalars().all())
+        if not restrictions:
+            return []
             
-        return restrictions
+        ids = [r.id for r in restrictions]
+        await self.session.execute(
+            update(UserRestriction)
+            .where(UserRestriction.id.in_(ids))
+            .values(
+                worker_id=worker_id,
+                claim_token=claim_token,
+                lease_expires_at=lease_expiry,
+                generation=UserRestriction.generation + 1
+            )
+        )
+            
+        res = await self.session.execute(select(UserRestriction).where(UserRestriction.id.in_(ids)))
+        return list(res.scalars().all())

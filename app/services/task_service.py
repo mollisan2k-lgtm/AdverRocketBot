@@ -186,28 +186,34 @@ class TaskService:
                 "Подписка не обнаружена. Пожалуйста, подпишитесь и попробуйте снова."
             )
 
-        # 3. Complete task and increment campaign (BEGIN IMMEDIATE protects this)
+        # 3. Complete task and increment campaign atomically
         campaign = await self.campaign_repo.get_by_id(task.campaign_id)
         if not campaign:
             raise TaskVerificationError("Campaign not found")
 
-        if campaign.completed >= campaign.target or campaign.status not in ("active", "paused"):
+        # Attempt atomic increment ensuring capacity
+        result = await self.session.execute(
+            update(Campaign)
+            .where(
+                Campaign.id == campaign.id,
+                Campaign.completed < Campaign.target,
+                Campaign.status.in_(("active", "paused"))
+            )
+            .values(completed=Campaign.completed + 1, updated_at=utc_now())
+        )
+        
+        if result.rowcount == 0:
+            # Atomic increment failed - either reached target or not active/paused
             await self.session.execute(
                 update(CampaignTask)
                 .where(CampaignTask.id == task.id)
                 .values(status="cancelled", updated_at=utc_now())
             )
-            raise TaskVerificationError("Кампания завершена — все места заняты.")
+            raise TaskVerificationError("Кампания завершена — все места заняты или кампания не активна.")
 
         claimed = await self.task_repo.complete_task(task.id)
         if not claimed:
             raise TaskVerificationError("Задание уже обработано или неактивно.")
-
-        await self.session.execute(
-            update(Campaign)
-            .where(Campaign.id == campaign.id)
-            .values(completed=Campaign.completed + 1, updated_at=utc_now())
-        )
         
         # In-memory update for the response dict
         campaign.completed += 1

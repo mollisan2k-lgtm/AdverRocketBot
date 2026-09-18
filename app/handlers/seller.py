@@ -5,6 +5,7 @@ Seller handlers: group management, tasks, withdrawals.
 from __future__ import annotations
 
 import logging
+import html
 from decimal import Decimal
 
 from aiogram import Router, F
@@ -220,7 +221,7 @@ async def cb_group_category_chosen(
         return
 
     await callback.message.edit_text(
-        f"✅ Группа <b>{group.title or chat_id}</b> отправлена на модерацию.\n\n"
+        f"✅ Группа <b>{html.escape(str(group.title or chat_id))}</b> отправлена на модерацию.\n\n"
         "Вы получите уведомление после проверки администратором.",
     )
     await state.clear()
@@ -252,7 +253,7 @@ async def cb_group_view(
     }.get(group.status, group.status)
 
     text = (
-        f"👥 <b>{group.title or group.telegram_chat_id}</b>\n\n"
+        f"👥 <b>{html.escape(str(group.title or group.telegram_chat_id))}</b>\n\n"
         f"Статус: {status_label}\n"
         f"Участники: {group.member_count or '?'}\n"
         f"Права бота: {'✅' if group.bot_has_rights else '⚠️ Утеряны'}\n"
@@ -518,7 +519,7 @@ async def cb_group_settings(
 
     text = (
         f"⚙️ <b>Настройки группы</b>\n\n"
-        f"👥 {group.title or group.telegram_chat_id}\n\n"
+        f"👥 {html.escape(str(group.title or group.telegram_chat_id))}\n\n"
         f"📦 Заданий за раздачу: <b>{group.tasks_per_distribution}</b>\n"
         f"   (сколько заданий получают участники за одну раздачу)\n\n"
         f"⏱ Интервал повтора: <b>{group.interval_minutes} мин</b>\n"

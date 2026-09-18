@@ -26,23 +26,44 @@ class UserRepository(BaseRepository[User]):
         last_name: str | None = None,
     ) -> tuple[User, bool]:
         """Get existing user or create new one. Returns (user, created)."""
-        user = await self.get_by_telegram_id(telegram_id)
-        if user:
-            # Update profile data on each interaction
-            if username != user.username or first_name != user.first_name:
-                user.username = username
-                user.first_name = first_name
-                user.last_name = last_name
-                await self.session.flush()
-            return user, False
-
-        user = await self.create(
+        from sqlalchemy.dialects.sqlite import insert
+        from app.utils.time_utils import utc_now
+        
+        now = utc_now()
+        stmt = insert(User).values(
             telegram_id=telegram_id,
             username=username,
             first_name=first_name,
             last_name=last_name,
+            available="0.00",
+            reserved="0.00",
+            created_at=now,
+            updated_at=now,
         )
-        return user, True
+        
+        # On conflict update profile data
+        update_dict = {
+            "username": stmt.excluded.username,
+            "first_name": stmt.excluded.first_name,
+            "last_name": stmt.excluded.last_name,
+            "updated_at": now,
+        }
+        
+        stmt = stmt.on_conflict_do_update(
+            index_elements=['telegram_id'],
+            set_=update_dict
+        ).returning(User)
+        
+        result = await self.session.execute(stmt)
+        await self.session.flush()
+        
+        user = result.scalar_one()
+        # We can't perfectly tell if it was created or updated with this approach 
+        # unless we compare created_at and updated_at, but we can assume False for 'created' 
+        # in most callers since they just need the user object.
+        # Let's check created_at == updated_at as a proxy for created.
+        created = user.created_at == user.updated_at
+        return user, created
 
     async def search_by_username(self, query: str) -> list[User]:
         """Search users by username (with or without @)."""

@@ -213,6 +213,11 @@ class SessionMiddleware(BaseMiddleware):
                 # All persistent writes must go exclusively through run_atomic().
                 return result
             except Exception as e:
+                from aiogram.exceptions import TelegramBadRequest
+                if isinstance(e, TelegramBadRequest) and "message is not modified" in str(e).lower():
+                    # Idempotent UI buttons may cause this. Ignore safely.
+                    return None
+
                 await session.rollback()
                 logger.exception("Exception in update %s", event.update_id)
                 

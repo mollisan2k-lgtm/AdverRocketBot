@@ -106,54 +106,44 @@ class RestrictionService:
         await run_atomic(_transition)
         return {"ok": success}
 
-    async def reconcile_record(self, restriction_id: int, worker_token: str) -> dict:
+    async def finalize_reconciliation(self, restriction_id: int, claim_token: str, expected_gen: int, success: bool, current_op_token: int) -> dict:
         """
-        Reconcile a single restriction record if worker_token matches.
-        Calls Telegram API to apply the desired state.
+        Phase 3: Finalize restriction reconciliation.
+        Checks generation, claim_token, and operation_token (to ensure desired_state didn't change while HTTP was running).
         """
-        # We need get_by_id, but we inherit from BaseRepository so it exists.
+        from sqlalchemy import update
         r = await self.repo.get_by_id(restriction_id)
         if not r:
             return {"ok": False, "error": "Not found"}
             
-        if r.worker_token != worker_token:
-            return {"ok": False, "error": "Worker token mismatch (fencing)"}
+        if r.claim_token != claim_token or r.generation != expected_gen:
+            return {"ok": False, "error": "Fenced out (generation/token mismatch)"}
             
-        if r.desired_state == r.actual_state:
-            return {"ok": True, "message": "Already in desired state"}
-
-        from app.repositories.group_repo import GroupRepository
-        group_repo = GroupRepository(self.session)
-        group = await group_repo.get_by_id(r.group_id)
-        
-        if not group:
-            return {"ok": False, "error": "Group not found"}
+        if r.operation_token != current_op_token:
+            # The desired_state changed during our HTTP call!
+            # We must NOT update actual_state to desired_state, because we applied an OLD desired_state.
+            # Instead, just release the lease and let the next loop iteration handle the new state.
+            await self.session.execute(
+                update(self.repo.model)
+                .where(self.repo.model.id == restriction_id)
+                .values(lease_expires_at=None, generation=self.repo.model.generation + 1)
+            )
+            return {"ok": False, "error": "Operation token mismatch (desired state changed during HTTP)"}
             
-        if not group.bot_has_rights:
-             return {"ok": False, "error": "Bot lost admin rights"}
-            
-        chat_id = group.telegram_chat_id
-        user_id = r.user_telegram_id
-        
-        target_state = r.desired_state
-        success = False
-        
-        if target_state == "ON":
-            success = await self.telegram_api.restrict_member(chat_id, user_id)
-        elif target_state == "OFF":
-            perms = None
-            if r.original_permissions_json:
-                try:
-                    perms = json.loads(r.original_permissions_json)
-                except Exception:
-                    pass
-            success = await self.telegram_api.unrestrict_member(chat_id, user_id, perms)
-
         if success:
-            r.actual_state = target_state
-            # When restriction is successfully lifted, we can clean up the record
-            # but usually it's kept around. The system just leaves it as OFF.
-            # However, if actual_state = OFF, it won't be returned by get_active_by_group.
+            await self.session.execute(
+                update(self.repo.model)
+                .where(
+                    self.repo.model.id == restriction_id,
+                    self.repo.model.claim_token == claim_token,
+                    self.repo.model.generation == expected_gen
+                )
+                .values(
+                    actual_state=r.desired_state,
+                    lease_expires_at=None if r.desired_state == "OFF" else r.lease_expires_at,
+                    generation=self.repo.model.generation + 1
+                )
+            )
             return {"ok": True}
         else:
             return {"ok": False, "error": "Telegram API failed"}

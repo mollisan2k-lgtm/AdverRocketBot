@@ -5,6 +5,7 @@ Common handlers: /start, /help, user registration middleware.
 from __future__ import annotations
 
 import logging
+import html
 
 from aiogram import Router, F
 from aiogram.filters import CommandStart, Command
@@ -77,13 +78,14 @@ async def cmd_balance(message: Message, session: AsyncSession) -> None:
 
     balance_service = BalanceService(session)
     available, reserved, held = await balance_service.get_balance(user.id)
-    total = available + reserved
+    total = available + reserved + held
 
     text_repo = TextRepository(session)
     tpl = await text_repo.get_text("balance_info")
     text = tpl.format(
         available=format_amount_plain(available),
         reserved=format_amount_plain(reserved),
+        held=format_amount_plain(held),
         total=format_amount_plain(total),
     )
 
@@ -139,7 +141,7 @@ async def cb_balance_show(callback: CallbackQuery, session: AsyncSession) -> Non
 
     balance_service = BalanceService(session)
     available, reserved, held = await balance_service.get_balance(user.id)
-    total = available + reserved
+    total = available + reserved + held
 
     text_repo = TextRepository(session)
     tpl = await text_repo.get_text("balance_info")

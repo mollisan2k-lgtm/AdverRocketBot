@@ -132,93 +132,156 @@ class WithdrawalService:
         )
         return True
 
-    async def process_payout(
+    async def prepare_payout(
         self,
         withdrawal_id: int,
-        worker_token: str | None = None,
-    ) -> dict:
-        """
-        Process approved withdrawal via Crypto Pay transfer.
-
-        Plan v4 spend_id lifecycle:
-        1. Generate spend_id = f"w{withdrawal_id}"
-        2. Check if transfer already exists (reconciliation before retry)
-        3. If not: create transfer
-        4. Update withdrawal + payout records
-        """
+        worker_id: str,
+        claim_token: str,
+        expected_gen: int,
+    ) -> dict | None:
+        """Phase 1: Prepare DB for payout."""
+        from sqlalchemy import update
         w = await self.repo.get_by_id(withdrawal_id)
         if not w or w.status not in ("approved", "processing"):
-            return {"ok": False, "error": "Invalid withdrawal status"}
+            return None
             
-        if worker_token and w.worker_token != worker_token:
-            return {"ok": False, "error": "Worker token mismatch (fencing)"}
+        if w.claim_token != claim_token or w.generation != expected_gen:
+            return None
 
-        if not self.crypto_pay:
-            return {"ok": False, "error": "Crypto Pay not configured"}
-
-        # Mark as processing
-        w.status = "processing"
-        w.updated_at = utc_now()
-        await self.session.flush()
-
-        amount = from_db(w.amount)
         spend_id = f"w{withdrawal_id}"
+        amount = from_db(w.amount)
+
+        res = await self.session.execute(
+            update(Withdrawal)
+            .where(
+                Withdrawal.id == withdrawal_id,
+                Withdrawal.claim_token == claim_token,
+                Withdrawal.generation == expected_gen
+            )
+            .values(
+                status="processing",
+                spend_id=spend_id,
+                updated_at=utc_now(),
+                generation=Withdrawal.generation + 1
+            )
+        )
+        if res.rowcount == 0:
+            return None
+
+        w.status = "processing"
         w.spend_id = spend_id
 
-        # 1. Reconciliation: check if transfer already exists
-        existing = await self.crypto_pay.find_transfer_by_spend_id(spend_id)
-        if existing:
-            # Transfer already succeeded
-            return await self._complete_payout(w, existing.transfer_id, spend_id, amount)
-
-        # 2. Create payout record
-        payout = Payout(
-            withdrawal_id=withdrawal_id,
-            user_id=w.user_id,
-            spend_id=spend_id,
-            amount=to_db(amount),
-            asset=w.asset,
-            status="pending",
-            created_at=utc_now(),
-            updated_at=utc_now(),
-        )
-        self.session.add(payout)
-        await self.session.flush()
-
-        # 3. Execute transfer
-        try:
-            transfer = await self.crypto_pay.transfer(
-                user_id=w.recipient_telegram_id,
-                asset=w.asset,
-                amount=str(amount),
+        # Create payout record if not exists
+        payout = await self.payout_repo.get_by_withdrawal(withdrawal_id)
+        if not payout:
+            payout = Payout(
+                withdrawal_id=withdrawal_id,
+                user_id=w.user_id,
                 spend_id=spend_id,
-                comment=f"Вывод #{withdrawal_id}",
+                amount=to_db(amount),
+                asset=w.asset,
+                status="pending",
+                created_at=utc_now(),
+                updated_at=utc_now(),
             )
-            return await self._complete_payout(
-                w, transfer.transfer_id, spend_id, amount, payout
-            )
+            self.session.add(payout)
 
-        except CryptoPayNetworkError:
-            # AMBIGUOUS — transfer may have succeeded
-            # Mark as processing and let reconciliation handle it
+        return {"ok": True, "spend_id": spend_id, "amount": amount}
+
+    async def finalize_payout_success(
+        self, withdrawal_id: int, claim_token: str, expected_gen: int, transfer_id: int
+    ) -> bool:
+        """Phase 3: Finalize on HTTP success."""
+        from sqlalchemy import update
+        w = await self.repo.get_by_id(withdrawal_id)
+        if not w or w.claim_token != claim_token or w.status != "processing" or w.generation != expected_gen:
+            return False
+            
+        res = await self.session.execute(
+            update(Withdrawal)
+            .where(
+                Withdrawal.id == withdrawal_id,
+                Withdrawal.claim_token == claim_token,
+                Withdrawal.generation == expected_gen
+            )
+            .values(generation=Withdrawal.generation + 1)
+        )
+        if res.rowcount == 0:
+            return False
+
+        amount = from_db(w.amount)
+        payout = await self.payout_repo.get_by_withdrawal(withdrawal_id)
+        return await self._complete_payout(w, transfer_id, w.spend_id, amount, payout)
+
+    async def mark_payout_ambiguous(self, withdrawal_id: int, claim_token: str, expected_gen: int) -> bool:
+        """Phase 3: Finalize on Network Error -> requires reconciliation."""
+        from sqlalchemy import update
+        w = await self.repo.get_by_id(withdrawal_id)
+        if not w or w.claim_token != claim_token or w.status != "processing" or w.generation != expected_gen:
+            return False
+            
+        res = await self.session.execute(
+            update(Withdrawal)
+            .where(
+                Withdrawal.id == withdrawal_id,
+                Withdrawal.claim_token == claim_token,
+                Withdrawal.generation == expected_gen
+            )
+            .values(
+                status="reconciliation_required",
+                updated_at=utc_now(),
+                generation=Withdrawal.generation + 1
+            )
+        )
+        if res.rowcount == 0:
+            return False
+            
+        payout = await self.payout_repo.get_by_withdrawal(withdrawal_id)
+        if payout:
             payout.status = "pending"
-            payout.error_message = "Network error — awaiting reconciliation"
-            logger.warning(
-                "Withdrawal %d transfer ambiguous (network error)",
-                withdrawal_id,
+            payout.error_message = "Network error - awaiting reconciliation"
+            payout.updated_at = utc_now()
+        return True
+
+    async def finalize_payout_failure(self, withdrawal_id: int, claim_token: str, expected_gen: int, error: str) -> bool:
+        """Phase 3: Finalize on HTTP failure."""
+        from sqlalchemy import update
+        w = await self.repo.get_by_id(withdrawal_id)
+        if not w or w.claim_token != claim_token or w.status != "processing" or w.generation != expected_gen:
+            return False
+            
+        res = await self.session.execute(
+            update(Withdrawal)
+            .where(
+                Withdrawal.id == withdrawal_id,
+                Withdrawal.claim_token == claim_token,
+                Withdrawal.generation == expected_gen
             )
-            return {"ok": False, "error": "network_ambiguous", "needs_reconciliation": True}
-
-        except CryptoPayError as e:
-            # Definite failure
+            .values(
+                status="failed",
+                error_message=error,
+                updated_at=utc_now(),
+                generation=Withdrawal.generation + 1
+            )
+        )
+        if res.rowcount == 0:
+            return False
+            
+        payout = await self.payout_repo.get_by_withdrawal(withdrawal_id)
+        if payout:
             payout.status = "failed"
-            payout.error_message = str(e)
-            w.status = "error"
-            w.error_message = str(e)
-            w.updated_at = utc_now()
-
-            logger.error("Withdrawal %d transfer failed: %s", withdrawal_id, e)
-            return {"ok": False, "error": str(e)}
+            payout.error_message = error
+            payout.updated_at = utc_now()
+        
+        amount = from_db(w.amount)
+        await self.balance_service.release_withdrawal(
+            user_id=w.user_id,
+            amount=amount,
+            withdrawal_id=withdrawal_id,
+            reason="Ошибка вывода — средства возвращены",
+            idempotency_key=f"withdrawal_error_release:{withdrawal_id}",
+        )
+        return True
 
     async def _complete_payout(
         self,
@@ -259,7 +322,7 @@ class WithdrawalService:
         Called after reconciliation confirms no transfer exists.
         """
         w = await self.repo.get_by_id(withdrawal_id)
-        if not w or w.status != "error":
+        if not w or w.status != "failed":
             return False
 
         amount = from_db(w.amount)
@@ -267,7 +330,7 @@ class WithdrawalService:
             user_id=w.user_id,
             amount=amount,
             withdrawal_id=withdrawal_id,
-            reason="Ошибка вывода — средства возвращены",
+            reason="Ошибка вывода — средства возвращены (реконсиляция)",
             idempotency_key=f"withdrawal_error_release:{withdrawal_id}",
         )
         return True

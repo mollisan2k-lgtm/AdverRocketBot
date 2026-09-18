@@ -28,6 +28,7 @@ Timestamps stored as UTC DateTime.
 from __future__ import annotations
 
 from datetime import datetime
+from app.utils.time_utils import utc_now
 
 from sqlalchemy import (
     BigInteger,
@@ -71,8 +72,8 @@ class User(Base):
     block_reason = Column(Text, nullable=True)
     blocked_at = Column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     # Relationships
     campaigns = relationship("Campaign", back_populates="user", lazy="selectin")
@@ -97,8 +98,8 @@ class Category(Base):
     status = Column(String(20), nullable=False, default="active")
     # Statuses: active, disabled, archived
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index("ix_categories_status", "status"),
@@ -133,8 +134,8 @@ class SellerGroup(Base):
     member_count = Column(Integer, nullable=True)
     deep_link_code = Column(String(100), nullable=True, unique=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     # Relationships
     user = relationship("User", back_populates="seller_groups")
@@ -145,6 +146,32 @@ class SellerGroup(Base):
         Index("ix_seller_groups_category", "category_id"),
     )
 
+
+# ── Seller Group Members ─────────────────────────────────────────────────────
+
+class SellerGroupMember(Base):
+    """
+    v5: Tracks users who joined seller groups to allow periodic task distribution.
+    """
+    __tablename__ = "seller_group_members"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    group_id = Column(Integer, ForeignKey("seller_groups.id"), nullable=False, index=True)
+    user_telegram_id = Column(BigInteger, nullable=False, index=True)
+
+    is_member = Column(Boolean, nullable=False, default=True)
+    status = Column(String(50), nullable=False, default="member")
+    
+    joined_at = Column(DateTime, nullable=True)
+    left_at = Column(DateTime, nullable=True)
+    last_seen_at = Column(DateTime, nullable=False, default=utc_now)
+
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
+
+    __table_args__ = (
+        UniqueConstraint("group_id", "user_telegram_id", name="uq_seller_group_members"),
+    )
 
 # ── Campaigns ────────────────────────────────────────────────────────────────
 
@@ -176,8 +203,8 @@ class Campaign(Base):
     # Statuses: active, paused, completed, cancelled
 
     completed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     # Relationships
     user = relationship("User", back_populates="campaigns")
@@ -211,10 +238,10 @@ class CampaignTask(Base):
     status = Column(String(20), nullable=False, default="active")
     # Statuses: active, completed, expired, cancelled
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
     expires_at = Column(DateTime, nullable=True)  # v3: task TTL
     completed_at = Column(DateTime, nullable=True)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     # Relationships
     campaign = relationship("Campaign", back_populates="tasks")
@@ -258,8 +285,8 @@ class TargetUserHistory(Base):
     next_available_at = Column(DateTime, nullable=True)  # v4: pre-calculated availability
     completion_count = Column(Integer, nullable=False, default=0)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         UniqueConstraint("user_telegram_id", "target_chat_id", name="uq_target_user_history"),
@@ -285,13 +312,14 @@ class UserRestriction(Base):
     # Restriction state machine
     desired_state = Column(String(10), nullable=False, default="ON")
     actual_state = Column(String(10), nullable=False, default="OFF")
-    operation_token = Column(Integer, nullable=False, default=0)
 
-    # Worker leases for restriction reconciliation
-    worker_token = Column(String(36), nullable=True)
+    # Worker leases & Fencing
+    worker_id = Column(String(50), nullable=True)
+    claim_token = Column(String(36), nullable=True)
     lease_expires_at = Column(DateTime, nullable=True)
+    generation = Column(Integer, nullable=False, default=1)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
 
     __table_args__ = (
         UniqueConstraint("group_id", "user_telegram_id", name="uq_user_restriction"),
@@ -311,8 +339,8 @@ class Deposit(Base):
     amount = Column(Text, nullable=False)  # Requested amount USDT
     asset = Column(String(20), nullable=False, default="USDT")
 
-    status = Column(String(20), nullable=False, default="pending")
-    # Statuses: pending, paid, expired, cancelled
+    status = Column(String(30), nullable=False, default="creation_pending")
+    # Statuses: creation_pending, pending_payment, paid, expired, reconciliation_required, cancelled
 
     pay_url = Column(Text, nullable=True)
     paid_at = Column(DateTime, nullable=True)
@@ -322,8 +350,14 @@ class Deposit(Base):
     external_status = Column(String(50), nullable=True)
     external_data_json = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    # Worker leases & Fencing
+    worker_id = Column(String(50), nullable=True)
+    claim_token = Column(String(36), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    generation = Column(Integer, nullable=False, default=1)
+
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index("ix_deposits_status", "status"),
@@ -342,8 +376,8 @@ class Withdrawal(Base):
     amount = Column(Text, nullable=False)
     asset = Column(String(20), nullable=False, default="USDT")
 
-    status = Column(String(20), nullable=False, default="pending")
-    # Statuses: pending, approved, processing, completed, rejected, error
+    status = Column(String(30), nullable=False, default="pending")
+    # Statuses: pending, approved, processing, reconciliation_required, completed, rejected, failed
 
     recipient_telegram_id = Column(BigInteger, nullable=True) # Added in Phase 9
 
@@ -354,14 +388,16 @@ class Withdrawal(Base):
     rejection_reason = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
 
-    # Worker leases for withdrawal execution
-    worker_token = Column(String(36), nullable=True)
+    # Worker leases & Fencing
+    worker_id = Column(String(50), nullable=True)
+    claim_token = Column(String(36), nullable=True)
     lease_expires_at = Column(DateTime, nullable=True)
+    generation = Column(Integer, nullable=False, default=1)
 
     approved_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index("ix_withdrawals_status", "status"),
@@ -370,7 +406,7 @@ class Withdrawal(Base):
             "uix_live_withdrawal_user",
             "user_id",
             unique=True,
-            sqlite_where=sa_text("status IN ('pending', 'approved', 'processing')"),
+            sqlite_where=sa_text("status IN ('pending', 'approved', 'processing', 'reconciliation_required')"),
         ),
     )
 
@@ -396,8 +432,8 @@ class Payout(Base):
     error_message = Column(Text, nullable=True)
     external_data_json = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
 
 # ── Balance Ledger ───────────────────────────────────────────────────────────
@@ -427,6 +463,8 @@ class BalanceLedger(Base):
     available_after = Column(Text, nullable=False)
     reserved_before = Column(Text, nullable=False)
     reserved_after = Column(Text, nullable=False)
+    held_before = Column(Text, nullable=False, default="0.00")
+    held_after = Column(Text, nullable=False, default="0.00")
 
     # References
     reference_type = Column(String(50), nullable=True)  # campaign, withdrawal, deposit, etc.
@@ -434,7 +472,7 @@ class BalanceLedger(Base):
     idempotency_key = Column(String(255), nullable=True, unique=True, index=True)
     reason = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
 
     __table_args__ = (
         Index("ix_ledger_user", "user_id"),
@@ -461,7 +499,7 @@ class Refund(Base):
     net_amount = Column(Text, nullable=False)          # Actual refund
     idempotency_key = Column(String(255), nullable=True, unique=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
 
 
 # ── Drafts ───────────────────────────────────────────────────────────────────
@@ -477,8 +515,8 @@ class Draft(Base):
     data_json = Column(Text, nullable=False, default="{}")
 
     expires_at = Column(DateTime, nullable=True)
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
     __table_args__ = (
         Index("ix_drafts_user", "user_id"),
@@ -497,7 +535,7 @@ class BotSetting(Base):
     value = Column(Text, nullable=False)
     description = Column(Text, nullable=True)
 
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
 
 # ── Bot Texts ────────────────────────────────────────────────────────────────
@@ -511,7 +549,7 @@ class BotText(Base):
     text = Column(Text, nullable=False)
     default_text = Column(Text, nullable=False)  # For "restore default"
 
-    updated_at = Column(DateTime, nullable=False, default=datetime.utcnow, onupdate=datetime.utcnow)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
 
 # ── Audit Log ────────────────────────────────────────────────────────────────
@@ -530,7 +568,7 @@ class AuditLog(Base):
     new_value_json = Column(Text, nullable=True)
     reason = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, nullable=False, default=utc_now, index=True)
 
     __table_args__ = (
         Index("ix_audit_object", "object_type", "object_id"),
@@ -554,7 +592,7 @@ class SystemError_(Base):
     resolved = Column(Boolean, nullable=False, default=False)
     resolved_at = Column(DateTime, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow, index=True)
+    created_at = Column(DateTime, nullable=False, default=utc_now, index=True)
 
     __table_args__ = (
         Index("ix_errors_severity", "severity"),
@@ -574,9 +612,12 @@ class IdempotencyKey(Base):
     id = Column(Integer, primary_key=True, autoincrement=True)
     key = Column(String(255), unique=True, nullable=False, index=True)
     operation = Column(String(100), nullable=False)
+    fingerprint = Column(String(255), nullable=True)
+    state = Column(String(20), nullable=False, default="completed")
     result_json = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    updated_at = Column(DateTime, nullable=False, default=utc_now, onupdate=utc_now)
 
 
 # ── Notifications ────────────────────────────────────────────────────────────
@@ -592,13 +633,23 @@ class NotificationOutbox(Base):
     telegram_id = Column(BigInteger, nullable=False, index=True)
     text = Column(Text, nullable=False)
     parse_mode = Column(String(50), nullable=True, default="HTML")
+    reply_markup_json = Column(Text, nullable=True)
+    kind = Column(String(50), nullable=True)
+    dedupe_key = Column(String(255), nullable=True, unique=True)
     
-    # Status: pending, sent, error
+    # Status: pending, processing, sent, dead
     status = Column(String(50), nullable=False, default="pending", index=True)
-    error_details = Column(Text, nullable=True)
+    attempts = Column(Integer, nullable=False, default=0)
+    next_attempt_at = Column(DateTime, nullable=True)
+    # Worker leases & Fencing
+    worker_id = Column(String(50), nullable=True)
+    claim_token = Column(String(36), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
+    generation = Column(Integer, nullable=False, default=1)
+    last_error = Column(Text, nullable=True)
 
-    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
-    processed_at = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, nullable=False, default=utc_now)
+    sent_at = Column(DateTime, nullable=True)
 
     __table_args__ = (
         Index("ix_notification_status", "status"),

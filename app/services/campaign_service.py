@@ -58,6 +58,7 @@ class CampaignService:
         target_username: str | None,
         target_title_snapshot: str,
         target_link: str,
+        idempotency_key: str | None = None,
     ) -> Campaign:
         """
         Create a campaign with atomic reserve.
@@ -70,6 +71,25 @@ class CampaignService:
 
         Raises InsufficientFundsError if not enough balance.
         """
+        if target <= 0:
+            raise ValueError("Таргет должен быть больше нуля.")
+        if target > 1000000:
+            raise ValueError("Таргет слишком большой.")
+
+        if idempotency_key:
+            from app.db.models import IdempotencyKey
+            import json
+            existing = await self.session.execute(
+                select(IdempotencyKey).where(IdempotencyKey.key == idempotency_key)
+            )
+            ik = existing.scalar_one_or_none()
+            if ik and ik.state == "completed":
+                try:
+                    res = json.loads(ik.result_json)
+                    return await self.session.get(Campaign, res["campaign_id"])
+                except Exception:
+                    pass
+
         # 1. Snapshot category
         category = await self.session.get(Category, category_id)
         if not category or category.status != "active":
@@ -107,6 +127,18 @@ class CampaignService:
             campaign_id=campaign.id,
             idempotency_key=f"campaign_reserve:{campaign.id}",
         )
+
+        if idempotency_key:
+            from app.db.models import IdempotencyKey
+            import json
+            ik = IdempotencyKey(
+                key=idempotency_key,
+                operation="create_campaign",
+                state="completed",
+                result_json=json.dumps({"campaign_id": campaign.id})
+            )
+            self.session.add(ik)
+            await self.session.flush()
 
         logger.info(
             "Campaign created: id=%d user=%d target=%d cost=%s",
@@ -355,8 +387,8 @@ class CampaignService:
         self,
         campaign_id: int,
         new_target: int,
-        commission_percent: Decimal | None = None,
         user_id: int | None = None,
+        commission_percent: Decimal | None = None,
     ) -> dict[str, Any] | None:
         """
         Decrease campaign target (active/paused).

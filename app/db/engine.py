@@ -95,7 +95,8 @@ async def run_atomic(operation: Callable[[AsyncSession], Awaitable[T]], max_retr
                 return result
             except OperationalError as e:
                 await session.rollback()
-                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                err_msg = str(e).lower()
+                if ("database is locked" in err_msg or "database table is locked" in err_msg or "busy" in err_msg) and attempt < max_retries - 1:
                     await asyncio.sleep(base_delay * (2 ** attempt))
                     continue
                 raise
