@@ -787,13 +787,15 @@ async def msg_admin_user_query(message: Message, session: AsyncSession, state: F
     from app.utils.decimal_utils import format_amount_plain
     
     balance_service = BalanceService(session)
-    available, reserved = await balance_service.get_balance(user.id)
+    available, reserved, held = await balance_service.get_balance(user.id)
     
     text = (
         f"👤 <b>Профиль пользователя</b>\n\n"
         f"ID: <code>{user.telegram_id}</code>\n"
         f"Username: @{user.username or '—'}\n"
-        f"Баланс: {format_amount_plain(available)} USDT\n"
+        f"Доступно: {format_amount_plain(available)} USDT\n"
+        f"В резерве: {format_amount_plain(reserved)} USDT\n"
+        f"В холде: {format_amount_plain(held)} USDT\n"
         f"Статус: {'⛔ Заблокирован' if user.is_blocked else '✅ Активен'}\n"
     )
     if user.is_blocked:
@@ -871,7 +873,7 @@ async def msg_admin_adjust_user(
         return
 
     balance_service = BalanceService(session)
-    available, reserved = await balance_service.get_balance(user.id)
+    available, reserved, held = await balance_service.get_balance(user.id)
 
     await state.update_data(user_id=user.id, tg_id=tg_id)
     await message.answer(

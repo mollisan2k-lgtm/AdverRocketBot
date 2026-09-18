@@ -114,7 +114,7 @@ class TaskService:
             user_telegram_id=user_telegram_id,
             target_chat_id=campaign.target_chat_id,
             interval_minutes_snapshot=group.interval_minutes,
-            status="active",
+            status="pending_restriction",
             created_at=utc_now(),
             # TTL: task expires in 24 hours if not completed
             expires_at=utc_now() + timedelta(hours=24),
@@ -170,27 +170,24 @@ class TaskService:
                 "Подписка не обнаружена. Пожалуйста, подпишитесь и попробуйте снова."
             )
 
-        # 3. Atomic increment — the critical race-safe operation
-        incremented = await self._atomic_increment_completed(task.campaign_id)
+        # 3. Complete task and increment campaign (BEGIN IMMEDIATE protects this)
+        campaign = await self.campaign_repo.get_by_id(task.campaign_id)
+        if not campaign:
+            raise TaskVerificationError("Campaign not found")
 
-        if not incremented:
-            # Campaign target reached or status changed during this task
-            # Cancel the task
+        if campaign.completed >= campaign.target or campaign.status not in ("active", "paused"):
             task.status = "cancelled"
             task.updated_at = utc_now()
-            raise TaskVerificationError(
-                "Кампания завершена — все места заняты."
-            )
+            raise TaskVerificationError("Кампания завершена — все места заняты.")
 
-        # 4. Complete task
         task.status = "completed"
         task.completed_at = utc_now()
         task.updated_at = utc_now()
 
+        campaign.completed += 1
+        campaign.updated_at = utc_now()
+
         # 5. Financial operations
-        campaign = await self.campaign_repo.get_by_id(task.campaign_id)
-        if not campaign:
-            raise TaskVerificationError("Campaign not found after increment")
 
         buyer_price = from_db(campaign.buyer_price_snapshot)
         seller_payout = from_db(campaign.seller_payout_snapshot)
@@ -241,31 +238,7 @@ class TaskService:
             "campaign_finished": campaign.completed >= campaign.target,
         }
 
-    async def _atomic_increment_completed(self, campaign_id: int) -> bool:
-        """
-        Atomically increment campaign.completed.
 
-        Uses: UPDATE campaigns SET completed = completed + 1
-              WHERE id = :id AND completed < target
-              AND status IN ('active', 'paused')
-
-        Returns True if a row was affected (slot was available).
-        """
-        result = await self.session.execute(
-            text("""
-                UPDATE campaigns
-                SET completed = completed + 1,
-                    updated_at = :now
-                WHERE id = :campaign_id
-                  AND completed < target
-                  AND status IN ('active', 'paused')
-            """),
-            {
-                "campaign_id": campaign_id,
-                "now": utc_now(),
-            },
-        )
-        return result.rowcount > 0
 
     async def _finalize_campaign_completion(self, campaign: Campaign) -> None:
         """

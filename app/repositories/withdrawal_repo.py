@@ -9,6 +9,7 @@ from sqlalchemy import select, update, func
 from app.db.models import Withdrawal
 from app.repositories.base import BaseRepository
 from app.utils.time_utils import utc_now
+from datetime import timedelta
 
 
 # Allowed withdrawal state transitions
@@ -103,3 +104,27 @@ class WithdrawalRepository(BaseRepository[Withdrawal]):
             .where(Withdrawal.status == "pending")
         )
         return result.scalar_one()
+
+    async def claim_for_processing(self, worker_token: str, lease_minutes: int = 5) -> Sequence[Withdrawal]:
+        """
+        Claim unassigned or expired-lease withdrawals for processing.
+        MUST be called inside atomic_session.
+        """
+        now = utc_now()
+        lease_expiry = now + timedelta(minutes=lease_minutes)
+        
+        result = await self.session.execute(
+            select(Withdrawal)
+            .where(
+                Withdrawal.status.in_(["approved", "processing"]),
+                (Withdrawal.lease_expires_at == None) | (Withdrawal.lease_expires_at <= now)
+            )
+        )
+        withdrawals = result.scalars().all()
+        for w in withdrawals:
+            w.worker_token = worker_token
+            w.lease_expires_at = lease_expiry
+            w.status = "processing"
+            w.updated_at = now
+            
+        return withdrawals

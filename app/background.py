@@ -80,9 +80,12 @@ async def invoice_checker_loop(
                             )
                             if deposit and deposit.status == "pending":
                                 try:
-                                    await deposit_service.confirm_payment(
-                                        deposit.id, inv,
-                                    )
+                                    from app.db.engine import atomic_session
+                                    async with atomic_session() as write_session:
+                                        write_deposit_service = DepositService(write_session, crypto_pay)
+                                        await write_deposit_service.confirm_payment(
+                                            deposit.id, inv,
+                                        )
                                     logger.info(
                                         "Deposit %d confirmed via polling",
                                         deposit.id,
@@ -98,7 +101,10 @@ async def invoice_checker_loop(
                                 inv.invoice_id,
                             )
                             if deposit and deposit.status == "pending":
-                                await deposit_service.mark_expired(deposit.id)
+                                from app.db.engine import atomic_session
+                                async with atomic_session() as write_session:
+                                    write_deposit_service = DepositService(write_session, crypto_pay)
+                                    await write_deposit_service.mark_expired(deposit.id)
                                 logger.info(
                                     "Deposit %d marked expired", deposit.id,
                                 )
@@ -122,12 +128,12 @@ async def task_expiry_loop(interval: int = 60) -> None:
 
     while True:
         try:
-            async with session_factory() as session:
+            from app.db.engine import atomic_session
+            async with atomic_session() as session:
                 task_service = TaskService(session)
                 expired = await task_service.expire_stale_tasks()
                 if expired > 0:
                     logger.info("Expired %d stale tasks", expired)
-                await session.commit()
         except Exception as e:
             logger.error("Task expiry error: %s", e, exc_info=True)
 
@@ -147,39 +153,118 @@ async def rights_recheck_loop(
 
     while True:
         try:
+            from app.db.engine import session_factory, atomic_session
             async with session_factory() as session:
                 from app.repositories.group_repo import GroupRepository
                 group_repo = GroupRepository(session)
                 groups = await group_repo.get_approved()
 
-                group_service = GroupService(session, telegram_api)
-                checked = 0
-                lost = 0
+            checked = 0
+            lost = 0
 
-                for group in groups:
-                    try:
-                        has_rights = await group_service.check_and_update_rights(group)
-                        checked += 1
-                        if not has_rights:
-                            lost += 1
-                    except Exception as e:
-                        logger.warning(
-                            "Rights check failed for group %d: %s",
-                            group.id, e,
-                        )
-                    # Rate limit: 1 check per 0.5s
-                    await asyncio.sleep(0.5)
+            for group in groups:
+                if not group: continue
+                try:
+                    # HTTP call OUTSIDE of transaction
+                    check = await telegram_api.check_group_suitability(group.telegram_chat_id)
+                    
+                    # DB update INSIDE transaction
+                    async with atomic_session() as update_session:
+                        update_repo = GroupRepository(update_session)
+                        db_group = await update_repo.get_by_id(group.id)
+                        if db_group:
+                            had_rights = db_group.bot_has_rights
+                            db_group.bot_has_rights = check.ok
 
-                await session.commit()
+                            if not check.ok and had_rights:
+                                db_group.rights_lost_at = utc_now()
+                                logger.warning(
+                                    "Bot lost rights in group %d (%s): %s",
+                                    db_group.id, db_group.telegram_chat_id, check.reason,
+                                )
+                            elif check.ok and not had_rights:
+                                db_group.rights_lost_at = None
+                                logger.info("Bot rights restored in group %d", db_group.id)
 
-                if checked > 0:
-                    logger.info(
-                        "Rights recheck: %d groups checked, %d lost rights",
-                        checked, lost,
+                            if check.member_count > 0:
+                                db_group.member_count = check.member_count
+
+                            db_group.updated_at = utc_now()
+
+                    checked += 1
+                    if not check.ok:
+                        lost += 1
+                except Exception as e:
+                    logger.warning(
+                        "Rights check failed for group %d: %s",
+                        group.id, e,
                     )
+                # Rate limit: 1 check per 0.5s
+                await asyncio.sleep(0.5)
+
+            if checked > 0:
+                logger.info(
+                    "Rights recheck: %d groups checked, %d lost rights",
+                    checked, lost,
+                )
 
         except Exception as e:
             logger.error("Rights recheck error: %s", e, exc_info=True)
+
+        await asyncio.sleep(interval)
+
+
+# ── Restriction Reconciliation ───────────────────────────────────────────────
+
+async def restriction_reconciliation_loop(
+    telegram_api: TelegramAPIService,
+    interval: int = 15,
+) -> None:
+    """
+    Background loop to align actual_state with desired_state for user restrictions.
+    Uses worker_token fencing and atomic_session.
+    """
+    import uuid
+    worker_token = str(uuid.uuid4())
+    logger.info("Restriction reconciliation started (interval=%ds, worker_token=%s)", interval, worker_token)
+
+    while True:
+        try:
+            from app.db.engine import atomic_session
+            
+            # 1. Claim restrictions that need reconciliation
+            async with atomic_session() as session:
+                from app.repositories.restriction_repo import RestrictionRepository
+                repo = RestrictionRepository(session)
+                claimed = await repo.claim_for_reconciliation(worker_token, lease_minutes=2)
+            
+            if not claimed:
+                await asyncio.sleep(interval)
+                continue
+
+            # 2. Process each claimed record
+            for r in claimed:
+                try:
+                    async with atomic_session() as process_session:
+                        from app.services.restriction_service import RestrictionService
+                        r_service = RestrictionService(process_session, telegram_api)
+                        
+                        result = await r_service.reconcile_record(r.id, worker_token)
+                        if result.get("ok"):
+                            logger.debug(
+                                "Restriction %d reconciled (user=%d, group=%d)",
+                                r.id, r.user_telegram_id, r.group_id
+                            )
+                        else:
+                            logger.error(
+                                "Restriction %d failed reconciliation: %s",
+                                r.id, result.get("error")
+                            )
+                except Exception as e:
+                    logger.error("Error reconciling restriction %d: %s", r.id, e, exc_info=True)
+
+        except Exception as e:
+            logger.error("Restriction reconciliation loop error: %s", e, exc_info=True)
 
         await asyncio.sleep(interval)
 
@@ -192,26 +277,41 @@ async def withdrawal_processor_loop(
 ) -> None:
     """
     Process approved withdrawals via Crypto Pay transfers.
+    Uses worker_token fencing and atomic_session to prevent double-spending.
     """
-    logger.info("Withdrawal processor started (interval=%ds)", interval)
+    import uuid
+    worker_token = str(uuid.uuid4())
+    logger.info("Withdrawal processor started (interval=%ds, worker_token=%s)", interval, worker_token)
 
     while True:
         try:
-            async with session_factory() as session:
-                wd_service = WithdrawalService(session, crypto_pay)
-                approved = await wd_service.get_approved()
+            from app.db.engine import atomic_session
+            
+            # 1. Claim withdrawals
+            async with atomic_session() as session:
+                from app.repositories.withdrawal_repo import WithdrawalRepository
+                wd_repo = WithdrawalRepository(session)
+                claimed = await wd_repo.claim_for_processing(worker_token, lease_minutes=5)
+            
+            if not claimed:
+                await asyncio.sleep(interval)
+                continue
 
-                for w in approved:
-                    try:
+            # 2. Process each claimed withdrawal
+            for w in claimed:
+                try:
+                    async with atomic_session() as process_session:
+                        wd_service = WithdrawalService(process_session, crypto_pay)
+                        
                         # Look up user's telegram_id
                         from app.repositories.user_repo import UserRepository
-                        user_repo = UserRepository(session)
+                        user_repo = UserRepository(process_session)
                         user = await user_repo.get_by_id(w.user_id)
                         if not user:
                             continue
 
                         result = await wd_service.process_payout(
-                            w.id, user.telegram_id,
+                            w.id, user.telegram_id, worker_token=worker_token
                         )
                         if result.get("ok"):
                             logger.info(
@@ -229,21 +329,20 @@ async def withdrawal_processor_loop(
                                 w.id, result.get("error"),
                             )
 
-                    except Exception as e:
-                        logger.error(
-                            "Withdrawal %d processing error: %s",
-                            w.id, e, exc_info=True,
-                        )
-                        # Log to system_errors
-                        error_repo = SystemErrorRepository(session)
+                except Exception as e:
+                    logger.error(
+                        "Withdrawal %d processing error: %s",
+                        w.id, e, exc_info=True,
+                    )
+                    async with atomic_session() as err_session:
+                        from app.repositories.error_repo import SystemErrorRepository
+                        error_repo = SystemErrorRepository(err_session)
                         await error_repo.log_error(
                             error_type="withdrawal_processing",
                             message=str(e),
                             severity="high",
                             details_json=f'{{"withdrawal_id": {w.id}}}',
                         )
-
-                await session.commit()
 
         except Exception as e:
             logger.error("Withdrawal processor error: %s", e, exc_info=True)
@@ -275,98 +374,101 @@ async def task_distribution_loop(
 
     while True:
         try:
+            from app.db.engine import session_factory, atomic_session
+            
             async with session_factory() as session:
                 from app.repositories.group_repo import GroupRepository
-                from app.repositories.restriction_repo import RestrictionRepository
-                from app.services.task_service import TaskService, TaskDistributionError
-                from app.services.campaign_service import CampaignService
-                from app.repositories.settings_repo import SettingsRepository
-                from app.repositories.task_repo import TaskRepository
-
                 group_repo = GroupRepository(session)
-                restriction_repo = RestrictionRepository(session)
-                task_service = TaskService(session)
-                campaign_service = CampaignService(session)
-                settings_repo = SettingsRepository(session)
-                task_repo = TaskRepository(session)
-
-                max_tasks_str = await settings_repo.get_value("max_tasks_per_user")
-                max_tasks_per_user = int(max_tasks_str) if max_tasks_str else 3
-
                 groups = await group_repo.get_approved()
-                distributed = 0
-                skipped = 0
 
-                for group in groups:
-                    if not group.bot_has_rights:
-                        continue  # Skip groups where bot lost rights
+            distributed = 0
+            skipped = 0
 
-                    # Get users currently restricted in this group (awaiting task completion)
-                    restricted_users = await restriction_repo.get_active_by_group(
-                        group.id
-                    )
+            for group in groups:
+                if not group.bot_has_rights:
+                    continue
 
-                    # Find distributable campaigns for this group's category
-                    campaigns = await campaign_service.get_distributable_campaigns(
-                        group.category_id
-                    )
-                    if not campaigns:
-                        continue
+                async with session_factory() as session:
+                    from app.repositories.restriction_repo import RestrictionRepository
+                    from app.services.campaign_service import CampaignService
+                    restriction_repo = RestrictionRepository(session)
+                    campaign_service = CampaignService(session)
+                    
+                    restricted_users = await restriction_repo.get_active_by_group(group.id)
+                    campaigns = await campaign_service.get_distributable_campaigns(group.category_id)
 
-                    for restriction in restricted_users:
-                        user_tg_id = restriction.user_telegram_id
+                if not campaigns or not restricted_users:
+                    continue
 
-                        # Check max_tasks_per_user
-                        active_tasks = await task_repo.get_active_by_user(user_tg_id)
-                        active_count = len(active_tasks)
-                        if active_count >= max_tasks_per_user:
-                            continue
+                for restriction in restricted_users:
+                    user_tg_id = restriction.user_telegram_id
 
-                        user_distributed = 0
+                    # Assign tasks atomically per user
+                    try:
+                        async with atomic_session() as assign_session:
+                            from app.services.task_service import TaskService, TaskDistributionError
+                            from app.repositories.task_repo import TaskRepository
+                            from app.repositories.settings_repo import SettingsRepository
+                            from app.repositories.campaign_repo import CampaignRepository
+                            
+                            task_service = TaskService(assign_session)
+                            task_repo = TaskRepository(assign_session)
+                            settings_repo = SettingsRepository(assign_session)
+                            campaign_repo = CampaignRepository(assign_session)
 
-                        # Try to find campaigns for them
-                        for campaign in campaigns:
-                            if user_distributed >= group.tasks_per_distribution:
-                                break
-                                
+                            max_tasks_str = await settings_repo.get_value("max_tasks_per_user")
+                            max_tasks_per_user = int(max_tasks_str) if max_tasks_str else 3
+
+                            active_tasks = await task_repo.get_active_by_user(user_tg_id)
+                            active_count = len(active_tasks)
                             if active_count >= max_tasks_per_user:
-                                break
-
-                            if campaign.completed >= campaign.target:
                                 continue
 
-                            try:
-                                task = await task_service.assign_task(
-                                    user_telegram_id=user_tg_id,
-                                    campaign_id=campaign.id,
-                                    group_id=group.id,
-                                )
-                                distributed += 1
-                                user_distributed += 1
-                                active_count += 1
-                                logger.debug(
-                                    "Task %d distributed: user=%d campaign=%d group=%d",
-                                    task.id, user_tg_id, campaign.id, group.id,
-                                )
-                            except TaskDistributionError:
-                                skipped += 1
-                                continue
-                            except Exception as e:
-                                logger.warning(
-                                    "Distribution error for user=%d campaign=%d: %s",
-                                    user_tg_id, campaign.id, e,
-                                )
-                                continue
+                            user_distributed = 0
 
-                    await asyncio.sleep(0.1)  # Yield between groups
+                            for camp in campaigns:
+                                if user_distributed >= group.tasks_per_distribution:
+                                    break
+                                    
+                                if active_count >= max_tasks_per_user:
+                                    break
 
-                await session.commit()
+                                fresh_camp = await campaign_repo.get_by_id(camp.id)
+                                if not fresh_camp or fresh_camp.completed >= fresh_camp.target:
+                                    continue
 
-                if distributed > 0:
-                    logger.info(
-                        "Task distributor: distributed=%d skipped=%d",
-                        distributed, skipped,
-                    )
+                                try:
+                                    task = await task_service.assign_task(
+                                        user_telegram_id=user_tg_id,
+                                        campaign_id=fresh_camp.id,
+                                        group_id=group.id,
+                                    )
+                                    distributed += 1
+                                    user_distributed += 1
+                                    active_count += 1
+                                    logger.debug(
+                                        "Task %d distributed: user=%d campaign=%d group=%d",
+                                        task.id, user_tg_id, fresh_camp.id, group.id,
+                                    )
+                                except TaskDistributionError:
+                                    skipped += 1
+                                    continue
+                                except Exception as e:
+                                    logger.warning(
+                                        "Distribution error for user=%d campaign=%d: %s",
+                                        user_tg_id, fresh_camp.id, e,
+                                    )
+                                    continue
+                    except Exception as e:
+                        logger.error("Distribution atomic session failed for user %d: %s", user_tg_id, e)
+
+                await asyncio.sleep(0.1)  # Yield between groups
+
+            if distributed > 0:
+                logger.info(
+                    "Task distributor: distributed=%d skipped=%d",
+                    distributed, skipped,
+                )
 
         except Exception as e:
             logger.error("Task distributor error: %s", e, exc_info=True)
@@ -401,6 +503,10 @@ def start_background_tasks(
         asyncio.create_task(
             task_distribution_loop(telegram_api, interval=300),
             name="task_distributor",
+        ),
+        asyncio.create_task(
+            restriction_reconciliation_loop(telegram_api, interval=15),
+            name="restriction_reconciliation",
         ),
     ]
     logger.info("Started %d background tasks", len(tasks))

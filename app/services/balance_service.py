@@ -50,13 +50,14 @@ class BalanceSnapshot:
     """Result of a balance operation."""
     available: Decimal
     reserved: Decimal
+    held: Decimal
     amount: Decimal
     operation_type: str
     ledger_id: int
 
     @property
     def total(self) -> Decimal:
-        return self.available + self.reserved
+        return self.available + self.reserved + self.held
 
 
 class BalanceService:
@@ -87,6 +88,8 @@ class BalanceService:
         new_reserved: Decimal,
         old_available: Decimal,
         old_reserved: Decimal,
+        new_held: Decimal | None = None,
+        old_held: Decimal | None = None,
         reference_type: str | None = None,
         reference_id: int | None = None,
         idempotency_key: str | None = None,
@@ -106,10 +109,11 @@ class BalanceService:
             user_id,
             available=to_db(new_available),
             reserved=to_db(new_reserved),
+            held_for_withdrawal=to_db(new_held) if new_held is not None else None,
         )
 
-        old_total = old_available + old_reserved
-        new_total = new_available + new_reserved
+        old_total = old_available + old_reserved + (old_held or ZERO)
+        new_total = new_available + new_reserved + (new_held or ZERO)
 
         # Record ledger
         entry = await self.ledger_repo.record(
@@ -144,6 +148,7 @@ class BalanceService:
         return BalanceSnapshot(
             available=new_available,
             reserved=new_reserved,
+            held=new_held or ZERO,
             amount=amount,
             operation_type=operation_type,
             ledger_id=entry.id,
@@ -348,11 +353,12 @@ class BalanceService:
     ) -> BalanceSnapshot:
         """
         Reserve funds for pending withdrawal.
-        available -= amount, reserved += amount
+        available -= amount, held_for_withdrawal += amount
         """
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         if old_available < amount:
@@ -361,7 +367,7 @@ class BalanceService:
             )
 
         new_available = old_available - amount
-        new_reserved = old_reserved + amount
+        new_held = old_held + amount
 
         return await self._apply(
             user_id=user_id,
@@ -369,9 +375,11 @@ class BalanceService:
             amount=amount,
             direction="debit",
             new_available=new_available,
-            new_reserved=new_reserved,
+            new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=new_held,
+            old_held=old_held,
             reference_type="withdrawal",
             reference_id=withdrawal_id,
             idempotency_key=idempotency_key or f"withdrawal_reserve:{withdrawal_id}",
@@ -387,19 +395,20 @@ class BalanceService:
     ) -> BalanceSnapshot:
         """
         Finalize withdrawal — money leaves the system.
-        reserved -= amount
+        held_for_withdrawal -= amount
         """
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
-        if old_reserved < amount:
+        if old_held < amount:
             raise InsufficientReserveError(
-                f"Need {amount} from reserve, have {old_reserved}"
+                f"Need {amount} from held, have {old_held}"
             )
 
-        new_reserved = old_reserved - amount
+        new_held = old_held - amount
 
         return await self._apply(
             user_id=user_id,
@@ -407,9 +416,11 @@ class BalanceService:
             amount=amount,
             direction="debit",
             new_available=old_available,
-            new_reserved=new_reserved,
+            new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=new_held,
+            old_held=old_held,
             reference_type="withdrawal",
             reference_id=withdrawal_id,
             idempotency_key=idempotency_key or f"withdrawal_payout:{withdrawal_id}",
@@ -426,20 +437,21 @@ class BalanceService:
     ) -> BalanceSnapshot:
         """
         Release withdrawal reserve (rejected / failed).
-        reserved -= amount, available += amount
+        held_for_withdrawal -= amount, available += amount
         """
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
-        if old_reserved < amount:
+        if old_held < amount:
             raise InsufficientReserveError(
-                f"Need {amount} from reserve, have {old_reserved}"
+                f"Need {amount} from held, have {old_held}"
             )
 
         new_available = old_available + amount
-        new_reserved = old_reserved - amount
+        new_held = old_held - amount
 
         return await self._apply(
             user_id=user_id,
@@ -447,9 +459,11 @@ class BalanceService:
             amount=amount,
             direction="credit",
             new_available=new_available,
-            new_reserved=new_reserved,
+            new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=new_held,
+            old_held=old_held,
             reference_type="withdrawal",
             reference_id=withdrawal_id,
             idempotency_key=idempotency_key or f"withdrawal_release:{withdrawal_id}",
@@ -543,9 +557,9 @@ class BalanceService:
 
     # ── Query ────────────────────────────────────────────────────────────
 
-    async def get_balance(self, user_id: int) -> tuple[Decimal, Decimal]:
-        """Get (available, reserved) without locking."""
+    async def get_balance(self, user_id: int) -> tuple[Decimal, Decimal, Decimal]:
+        """Get (available, reserved, held) without locking."""
         user = await self.user_repo.get_by_id(user_id)
         if user is None:
-            return ZERO, ZERO
-        return from_db(user.available), from_db(user.reserved)
+            return ZERO, ZERO, ZERO
+        return from_db(user.available), from_db(user.reserved), from_db(user.held_for_withdrawal)

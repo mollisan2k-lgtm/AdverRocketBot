@@ -346,7 +346,7 @@ async def msg_campaign_target_count(
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(message.from_user.id)
     balance_service = BalanceService(session)
-    available, _ = await balance_service.get_balance(user.id)
+    available, _, _ = await balance_service.get_balance(user.id)
 
     balance_ok = available >= total_cost
     balance_status = "✅ Средств достаточно" if balance_ok else (
@@ -486,11 +486,17 @@ async def cb_campaign_list(callback: CallbackQuery, session: AsyncSession) -> No
 async def cb_campaign_view(callback: CallbackQuery, session: AsyncSession) -> None:
     """View single campaign details."""
     campaign_id = int(callback.data.split(":")[2])
+    
+    user_service = UserService(session)
+    user = await user_service.get_by_telegram_id(callback.from_user.id)
+    if not user:
+        return await callback.answer("Ошибка доступа", show_alert=True)
+        
     campaign_service = CampaignService(session)
     campaign = await campaign_service.get_by_id(campaign_id)
 
-    if not campaign:
-        await callback.answer("Кампания не найдена.", show_alert=True)
+    if not campaign or campaign.user_id != user.id:
+        await callback.answer("Кампания не найдена или нет доступа.", show_alert=True)
         return
 
     buyer_price = from_db(campaign.buyer_price_snapshot)
@@ -529,13 +535,14 @@ async def cb_campaign_pause(callback: CallbackQuery, session: AsyncSession) -> N
     campaign_id = int(callback.data.split(":")[2])
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
-    service = CampaignService(session)
-    
-    campaign = await service.campaign_repo.get_by_id(campaign_id)
-    if not campaign or not user or campaign.user_id != user.id:
-        return await callback.answer("Ошибка доступа", show_alert=True)
-        
-    ok = await service.pause_campaign(campaign_id)
+    from app.db.engine import atomic_session
+    async with atomic_session() as write_session:
+        service_write = CampaignService(write_session)
+        campaign = await service_write.campaign_repo.get_by_id(campaign_id)
+        if not campaign or not user or campaign.user_id != user.id:
+            return await callback.answer("Ошибка доступа", show_alert=True)
+            
+        ok = await service_write.pause_campaign(campaign_id)
     await callback.answer(
         "⏸ Кампания приостановлена" if ok else "Не удалось приостановить.",
         show_alert=not ok,
@@ -549,13 +556,14 @@ async def cb_campaign_resume(callback: CallbackQuery, session: AsyncSession) -> 
     campaign_id = int(callback.data.split(":")[2])
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
-    service = CampaignService(session)
-
-    campaign = await service.campaign_repo.get_by_id(campaign_id)
-    if not campaign or not user or campaign.user_id != user.id:
-        return await callback.answer("Ошибка доступа", show_alert=True)
-        
-    ok = await service.resume_campaign(campaign_id)
+    from app.db.engine import atomic_session
+    async with atomic_session() as write_session:
+        service_write = CampaignService(write_session)
+        campaign = await service_write.campaign_repo.get_by_id(campaign_id)
+        if not campaign or not user or campaign.user_id != user.id:
+            return await callback.answer("Ошибка доступа", show_alert=True)
+            
+        ok = await service_write.resume_campaign(campaign_id)
     await callback.answer(
         "▶️ Кампания возобновлена" if ok else "Не удалось возобновить.",
         show_alert=not ok,
@@ -594,16 +602,16 @@ async def cb_campaign_cancel_confirm(callback: CallbackQuery, session: AsyncSess
     campaign_id = int(callback.data.split(":")[2])
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
-    service = CampaignService(session)
-
-    campaign = await service.campaign_repo.get_by_id(campaign_id)
-    if not campaign or not user or campaign.user_id != user.id:
-        return await callback.answer("Ошибка доступа", show_alert=True)
-
-    result = await service.cancel_campaign(campaign_id)
-
-    if result is None:
-        await callback.answer("Не удалось отменить.", show_alert=True)
+    try:
+        from app.db.engine import atomic_session
+        async with atomic_session() as write_session:
+            service = CampaignService(write_session)
+            result = await service.cancel_campaign(campaign_id)
+            if result is None:
+                await callback.answer("Не удалось отменить.", show_alert=True)
+                return
+    except Exception as e:
+        await callback.message.edit_text(f"❌ Ошибка: {e}")
         return
 
     await callback.message.edit_text(
@@ -680,7 +688,7 @@ async def msg_campaign_increase_count(
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(message.from_user.id)
     balance_service = BalanceService(session)
-    available, _ = await balance_service.get_balance(user.id)
+    available, _, _ = await balance_service.get_balance(user.id)
 
     if available < extra_cost:
         await message.answer(
@@ -731,18 +739,20 @@ async def cb_campaign_increase_confirm(
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
 
-    campaign_service = CampaignService(session)
     try:
-        ok = await campaign_service.increase_target(
-            campaign_id=campaign_id,
-            additional=extra,
-        )
-        if not ok:
-            await callback.message.edit_text("❌ Кампания недоступна для увеличения цели.")
-            await state.clear()
-            await callback.answer()
-            return
-        campaign = await campaign_service.get_by_id(campaign_id)
+        from app.db.engine import atomic_session
+        async with atomic_session() as write_session:
+            campaign_service_write = CampaignService(write_session)
+            ok = await campaign_service_write.increase_target(
+                campaign_id=campaign_id,
+                additional=extra,
+            )
+            if not ok:
+                await callback.message.edit_text("❌ Кампания недоступна для увеличения цели.")
+                await state.clear()
+                await callback.answer()
+                return
+            campaign = await campaign_service_write.get_by_id(campaign_id)
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await state.clear()

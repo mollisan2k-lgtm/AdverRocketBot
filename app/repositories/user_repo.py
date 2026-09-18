@@ -82,13 +82,20 @@ class UserRepository(BaseRepository[User]):
         user_id: int,
         available: str,
         reserved: str,
+        held_for_withdrawal: str | None = None,
     ) -> int:
         """
         Atomically update user balance fields.
         Called within a transaction after validation.
         """
+        kwargs = {
+            "available": available,
+            "reserved": reserved,
+        }
+        if held_for_withdrawal is not None:
+            kwargs["held_for_withdrawal"] = held_for_withdrawal
+            
         return await self.update_by_id(
             user_id,
-            available=available,
-            reserved=reserved,
+            **kwargs
         )

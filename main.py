@@ -53,11 +53,7 @@ async def on_startup() -> None:
     config.ensure_dirs()
     logger.info("Data directory: %s", config.data_dir)
 
-    # 2. Create tables (if fresh DB, before Alembic catches up)
-    async with engine.begin() as conn:
-        await conn.run_sync(Base.metadata.create_all)
-    logger.info("Database tables ensured")
-
+    # 2. (Removed create_all; Alembic is the only source of truth)
     # 3. Run migrations
     try:
         run_migrations()

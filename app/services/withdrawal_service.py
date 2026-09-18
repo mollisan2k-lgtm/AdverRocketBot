@@ -129,6 +129,7 @@ class WithdrawalService:
         self,
         withdrawal_id: int,
         user_telegram_id: int,
+        worker_token: str | None = None,
     ) -> dict:
         """
         Process approved withdrawal via Crypto Pay transfer.
@@ -142,6 +143,9 @@ class WithdrawalService:
         w = await self.repo.get_by_id(withdrawal_id)
         if not w or w.status not in ("approved", "processing"):
             return {"ok": False, "error": "Invalid withdrawal status"}
+            
+        if worker_token and w.worker_token != worker_token:
+            return {"ok": False, "error": "Worker token mismatch (fencing)"}
 
         if not self.crypto_pay:
             return {"ok": False, "error": "Crypto Pay not configured"}

@@ -336,7 +336,7 @@ class CampaignService:
         self,
         campaign_id: int,
         new_target: int,
-        commission_percent: Decimal = Decimal("10"),
+        commission_percent: Decimal | None = None,
     ) -> dict[str, Any] | None:
         """
         Decrease campaign target (active/paused).
@@ -366,6 +366,11 @@ class CampaignService:
             return await self._finalize_completion_on_decrease(
                 campaign, new_target, slots_removed, commission_percent
             )
+
+        if commission_percent is None:
+            settings_repo = SettingsRepository(self.session)
+            val = await settings_repo.get_value("cancel_commission_percent")
+            commission_percent = Decimal(val) if val else Decimal("10")
 
         buyer_price = from_db(campaign.buyer_price_snapshot)
         gross = buyer_price * slots_removed
@@ -412,9 +417,14 @@ class CampaignService:
         campaign: Campaign,
         new_target: int,
         slots_removed: int,
-        commission_percent: Decimal,
+        commission_percent: Decimal | None,
     ) -> dict[str, Any]:
         """When decrease makes target == completed, finalize campaign."""
+        if commission_percent is None:
+            settings_repo = SettingsRepository(self.session)
+            val = await settings_repo.get_value("cancel_commission_percent")
+            commission_percent = Decimal(val) if val else Decimal("10")
+            
         buyer_price = from_db(campaign.buyer_price_snapshot)
         gross = buyer_price * slots_removed
         commission = round_down(gross * commission_percent / Decimal("100"))

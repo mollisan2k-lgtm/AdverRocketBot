@@ -335,26 +335,23 @@ async def cb_task_check(
     )
 
     try:
-        result = await task_service.verify_and_complete(task_id, is_subscribed)
+        from app.db.engine import atomic_session
+        async with atomic_session() as write_session:
+            task_service_write = TaskService(write_session)
+            result = await task_service_write.verify_and_complete(task_id, is_subscribed)
+            
+            # Set desired restriction state to OFF, let worker handle actual Telegram call
+            from app.repositories.restriction_repo import RestrictionRepository
+            restriction_repo = RestrictionRepository(write_session)
+            await restriction_repo.set_desired_state(
+                group_id=task.group_id,
+                user_telegram_id=callback.from_user.id,
+                desired_state="OFF"
+            )
+            # Transaction commits here
     except Exception as e:
         await callback.answer(str(e), show_alert=True)
         return
-
-    # Unrestrict user in the seller group (restore messaging rights)
-    from app.repositories.restriction_repo import RestrictionRepository
-    restriction_repo = RestrictionRepository(session)
-    original_perms = await restriction_repo.remove_restriction(
-        group_id=task.group_id,
-        user_telegram_id=callback.from_user.id,
-    )
-    group_service = GroupService(session, telegram_api)
-    group = await group_service.get_by_id(task.group_id)
-    if group and group.bot_has_rights:
-        await telegram_api.unrestrict_member(
-            chat_id=group.telegram_chat_id,
-            user_id=callback.from_user.id,
-            original_permissions=original_perms,
-        )
 
     text_repo = TextRepository(session)
     tpl = await text_repo.get_text("task_completed")
@@ -387,7 +384,7 @@ async def cb_withdraw_start(
         return
 
     balance_service = BalanceService(session)
-    available, _ = await balance_service.get_balance(user.id)
+    available, _, _ = await balance_service.get_balance(user.id)
 
     await callback.message.edit_text(
         f"📤 <b>Вывод средств</b>\n\n"
@@ -417,7 +414,7 @@ async def msg_withdraw_amount(
     user = await user_service.get_by_telegram_id(message.from_user.id)
 
     balance_service = BalanceService(session)
-    available, _ = await balance_service.get_balance(user.id)
+    available, _, _ = await balance_service.get_balance(user.id)
 
     if available < amount:
         await message.answer(
@@ -687,109 +684,62 @@ async def on_new_member(
     if not group or group.status != "approved" or not group.bot_has_rights:
         return
 
-    # 2. Restrict new member (prevent sending messages until task done)
-    from app.repositories.restriction_repo import RestrictionRepository
-    restriction_repo = RestrictionRepository(session)
-
-    # Capture original perms before restricting
+    # 2. Get original permissions via HTTP (outside transaction)
     original_perms = await telegram_api.get_member_permissions(chat_id, user_tg_id)
 
-    restricted = await telegram_api.restrict_member(chat_id, user_tg_id)
-    if not restricted:
-        logger.warning(
-            "Could not restrict user %d in group %d, skipping task assignment",
-            user_tg_id, group.id,
-        )
-        return
-
-    # Record restriction
-    await restriction_repo.add_restriction(
-        group_id=group.id,
-        user_telegram_id=user_tg_id,
-        original_permissions=original_perms,
-    )
-
-    # 3. Find a campaign to assign
+    # 3. Transactional task assignment and restriction recording
+    from app.db.engine import atomic_session
+    from app.repositories.restriction_repo import RestrictionRepository
     from app.services.campaign_service import CampaignService
     from app.services.task_service import TaskService, TaskDistributionError
-    from app.repositories.settings_repo import TextRepository
 
-    campaign_service = CampaignService(session)
-    task_service = TaskService(session)
+    task_id = None
+    async with atomic_session() as write_session:
+        campaign_service = CampaignService(write_session)
+        task_service = TaskService(write_session)
+        restriction_repo = RestrictionRepository(write_session)
 
-    campaigns = await campaign_service.get_distributable_campaigns(group.category_id)
-    task = None
+        campaigns = await campaign_service.get_distributable_campaigns(group.category_id)
+        task = None
+        for campaign in campaigns:
+            if campaign.completed >= campaign.target:
+                continue
+            try:
+                task = await task_service.assign_task(
+                    user_telegram_id=user_tg_id,
+                    campaign_id=campaign.id,
+                    group_id=group.id,
+                )
+                break
+            except TaskDistributionError as e:
+                logger.debug(
+                    "Task assignment skipped for user=%d campaign=%d: %s",
+                    user_tg_id, campaign.id, e,
+                )
+                continue
 
-    for campaign in campaigns:
-        if campaign.completed >= campaign.target:
-            continue
-        try:
-            task = await task_service.assign_task(
-                user_telegram_id=user_tg_id,
-                campaign_id=campaign.id,
+        if task:
+            # We got a task, so we want to restrict the user.
+            # Record desired_state="ON", actual_state="OFF"
+            await restriction_repo.add_restriction(
                 group_id=group.id,
+                user_telegram_id=user_tg_id,
+                original_permissions=original_perms,
             )
-            break
-        except TaskDistributionError as e:
-            logger.debug(
-                "Task assignment skipped for user=%d campaign=%d: %s",
-                user_tg_id, campaign.id, e,
-            )
-            continue
+            task_id = task.id
+        else:
+            # No task available.
+            # Do NOT restrict the user, just return.
+            pass
 
-    if task is None:
-        # No campaigns available — unrestrict user immediately
+    if task_id:
         logger.info(
-            "No campaigns for group=%d, unrestricting user=%d immediately",
+            "Task %d scheduled for pending_restriction for user=%d in group=%d", 
+            task_id, user_tg_id, group.id
+        )
+    else:
+        logger.info(
+            "No campaigns for group=%d, user=%d not restricted",
             group.id, user_tg_id,
         )
-        restored = await restriction_repo.remove_restriction(group.id, user_tg_id)
-        await telegram_api.unrestrict_member(chat_id, user_tg_id, restored)
-        return
 
-    # 4. Notify user in private DM
-    try:
-        campaign_obj = await campaign_service.get_by_id(task.campaign_id)
-        if campaign_obj:
-            from app.utils.decimal_utils import from_db, format_amount_plain
-            reward = format_amount_plain(from_db(campaign_obj.seller_payout_snapshot))
-            target_link = campaign_obj.target_link or campaign_obj.target_username or "?"
-            target_title = campaign_obj.target_title_snapshot
-
-            from aiogram.utils.keyboard import InlineKeyboardBuilder
-            kb = InlineKeyboardBuilder()
-            if campaign_obj.target_link:
-                kb.button(text=f"📢 Подписаться: {target_title}", url=campaign_obj.target_link)
-            kb.button(text="✅ Я подписался — проверить", callback_data=f"task:check:{task.id}")
-            kb.adjust(1)
-
-            text_repo = TextRepository(session)
-            try:
-                tpl = await text_repo.get_text("task_assigned")
-                msg_text = tpl.format(
-                    target_title=target_title,
-                    target_link=target_link,
-                    reward=reward,
-                    group_title=group.title or str(chat_id),
-                )
-            except Exception:
-                msg_text = (
-                    f"📋 <b>Новое задание!</b>\n\n"
-                    f"Подпишитесь на <b>{target_title}</b> и нажмите кнопку ниже.\n"
-                    f"🏆 Награда: <code>{reward}</code> USDT\n\n"
-                    f"После подписки вы получите доступ к написанию сообщений в группе."
-                )
-
-            await event.bot.send_message(
-                chat_id=user_tg_id,
-                text=msg_text,
-                reply_markup=kb.as_markup(),
-            )
-            logger.info(
-                "Task %d assigned to user=%d, DM sent", task.id, user_tg_id,
-            )
-    except Exception as e:
-        # DM failed (user may have blocked bot) — task still assigned, they'll see it via /tasks
-        logger.warning(
-            "Failed to send task DM to user=%d: %s", user_tg_id, e,
-        )

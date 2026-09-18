@@ -449,3 +449,15 @@ class CryptoPayService:
             return True
         except Exception:
             return False
+
+    def verify_signature(self, signature: str, body: bytes) -> bool:
+        """
+        Verify Crypto Pay webhook signature.
+        Uses SHA-256 HMAC of the request body with SHA256(token) as the secret.
+        """
+        import hmac
+        import hashlib
+        
+        secret = hashlib.sha256(self._token.encode("utf-8")).digest()
+        expected = hmac.new(secret, body, hashlib.sha256).hexdigest()
+        return hmac.compare_digest(expected, signature)

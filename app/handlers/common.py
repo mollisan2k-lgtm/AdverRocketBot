@@ -76,7 +76,7 @@ async def cmd_balance(message: Message, session: AsyncSession) -> None:
         return
 
     balance_service = BalanceService(session)
-    available, reserved = await balance_service.get_balance(user.id)
+    available, reserved, held = await balance_service.get_balance(user.id)
     total = available + reserved
 
     text_repo = TextRepository(session)
@@ -138,7 +138,7 @@ async def cb_balance_show(callback: CallbackQuery, session: AsyncSession) -> Non
         return
 
     balance_service = BalanceService(session)
-    available, reserved = await balance_service.get_balance(user.id)
+    available, reserved, held = await balance_service.get_balance(user.id)
     total = available + reserved
 
     text_repo = TextRepository(session)

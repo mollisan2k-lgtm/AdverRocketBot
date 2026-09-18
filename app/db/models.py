@@ -65,6 +65,7 @@ class User(Base):
     # Balance (stored as TEXT for Decimal precision)
     available = Column(Text, nullable=False, default="0.00")
     reserved = Column(Text, nullable=False, default="0.00")
+    held_for_withdrawal = Column(Text, nullable=False, default="0.00")
 
     is_blocked = Column(Boolean, nullable=False, default=False)
     block_reason = Column(Text, nullable=True)
@@ -80,6 +81,7 @@ class User(Base):
     __table_args__ = (
         CheckConstraint("CAST(available AS REAL) >= 0", name="ck_user_available_gte_0"),
         CheckConstraint("CAST(reserved AS REAL) >= 0", name="ck_user_reserved_gte_0"),
+        CheckConstraint("CAST(held_for_withdrawal AS REAL) >= 0", name="ck_user_held_gte_0"),
     )
 
 
@@ -229,12 +231,12 @@ class CampaignTask(Base):
             unique=True,
             sqlite_where=sa_text("status = 'active'"),
         ),
-        # v4: One active task per (user, target) globally
+        # v4: One live task per (user, target) globally
         Index(
             "uix_active_task_user_target",
             "user_telegram_id", "target_chat_id",
             unique=True,
-            sqlite_where=sa_text("status = 'active'"),
+            sqlite_where=sa_text("status IN ('active', 'pending_restriction')"),
         ),
     )
 
@@ -279,6 +281,15 @@ class UserRestriction(Base):
 
     restricted_by_bot = Column(Boolean, nullable=False, default=True)
     original_permissions_json = Column(Text, nullable=True)
+
+    # Restriction state machine
+    desired_state = Column(String(10), nullable=False, default="ON")
+    actual_state = Column(String(10), nullable=False, default="OFF")
+    operation_token = Column(Integer, nullable=False, default=0)
+
+    # Worker leases for restriction reconciliation
+    worker_token = Column(String(36), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
 
@@ -340,6 +351,10 @@ class Withdrawal(Base):
 
     rejection_reason = Column(Text, nullable=True)
     error_message = Column(Text, nullable=True)
+
+    # Worker leases for withdrawal execution
+    worker_token = Column(String(36), nullable=True)
+    lease_expires_at = Column(DateTime, nullable=True)
 
     approved_at = Column(DateTime, nullable=True)
     completed_at = Column(DateTime, nullable=True)

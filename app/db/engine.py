@@ -67,3 +67,40 @@ session_factory = create_session_factory(engine)
 async def get_session() -> AsyncSession:
     """Get a new async session. Use as async context manager or close manually."""
     return session_factory()
+
+
+class TransactionTimeoutError(Exception):
+    """Raised when atomic_session max retries are exhausted due to SQLite locks."""
+    pass
+
+
+import asyncio
+from contextlib import asynccontextmanager
+from typing import AsyncGenerator
+from sqlalchemy.exc import OperationalError
+
+
+@asynccontextmanager
+async def atomic_session(max_retries: int = 5, base_delay: float = 0.1) -> AsyncGenerator[AsyncSession, None]:
+    """
+    Get a new async session that immediately begins an exclusive write transaction.
+    Handles SQLITE_BUSY by cleanly rolling back, waiting, and retrying from scratch.
+    """
+    for attempt in range(max_retries):
+        async with session_factory() as session:
+            try:
+                # Force exclusive lock to prevent read-upgrade deadlocks
+                await session.execute(text("BEGIN IMMEDIATE"))
+                yield session
+                await session.commit()
+                return
+            except OperationalError as e:
+                await session.rollback()
+                if "database is locked" in str(e).lower() and attempt < max_retries - 1:
+                    await asyncio.sleep(base_delay * (2 ** attempt))
+                    continue
+                raise
+            except Exception:
+                await session.rollback()
+                raise
+    raise TransactionTimeoutError(f"Failed to acquire database lock after {max_retries} attempts.")
