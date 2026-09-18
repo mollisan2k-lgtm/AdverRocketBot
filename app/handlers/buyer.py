@@ -222,7 +222,7 @@ async def cb_campaign_cat_chosen(
     if user:
         draft_repo = DraftRepository(session)
         data = await state.get_data()
-        await draft_repo.create_or_update(user.id, data)
+        await draft_repo.upsert(user.id, data)
 
     kb = InlineKeyboardBuilder()
     kb.button(text="📢 Канал", callback_data="campaign:type:channel")
@@ -257,7 +257,7 @@ async def cb_campaign_type_chosen(
     if user:
         draft_repo = DraftRepository(session)
         data = await state.get_data()
-        await draft_repo.create_or_update(user.id, data)
+        await draft_repo.upsert(user.id, data)
 
     type_label = "канала" if target_type == "channel" else "группы"
     await callback.message.edit_text(
@@ -299,7 +299,7 @@ async def msg_campaign_target_link(
     if user:
         draft_repo = DraftRepository(session)
         data = await state.get_data()
-        await draft_repo.create_or_update(user.id, data)
+        await draft_repo.upsert(user.id, data)
 
     await message.answer(
         f"✅ <b>{target_info.target_title}</b>\n\n"
@@ -340,7 +340,7 @@ async def msg_campaign_target_count(
     if user:
         draft_repo = DraftRepository(session)
         data = await state.get_data()
-        await draft_repo.create_or_update(user.id, data)
+        await draft_repo.upsert(user.id, data)
 
     # Check balance
     user_service = UserService(session)
@@ -480,6 +480,9 @@ async def cb_campaign_list(callback: CallbackQuery, session: AsyncSession) -> No
     await callback.answer()
 
 
+class CampaignDecrease(StatesGroup):
+    entering_target = State()
+
 # ── Campaign view ────────────────────────────────────────────────────────────
 
 @buyer_router.callback_query(F.data.startswith("campaign:view:"))
@@ -517,12 +520,16 @@ async def cb_campaign_view(callback: CallbackQuery, session: AsyncSession) -> No
     if campaign.status == "active":
         kb.button(text="⏸ Пауза", callback_data=f"campaign:pause:{campaign_id}")
         kb.button(text="🎯 Увеличить", callback_data=f"campaign:increase:{campaign_id}")
+        if campaign.target > campaign.completed:
+            kb.button(text="📉 Уменьшить", callback_data=f"campaign:decrease:{campaign_id}")
         kb.button(text="🔴 Отменить", callback_data=f"campaign:cancel:{campaign_id}")
     elif campaign.status == "paused":
         kb.button(text="▶️ Возобновить", callback_data=f"campaign:resume:{campaign_id}")
+        if campaign.target > campaign.completed:
+            kb.button(text="📉 Уменьшить", callback_data=f"campaign:decrease:{campaign_id}")
         kb.button(text="🔴 Отменить", callback_data=f"campaign:cancel:{campaign_id}")
     kb.button(text="◀️ Назад", callback_data="campaign:list")
-    kb.adjust(2, 1)
+    kb.adjust(2)
 
     await callback.message.edit_text(text, reply_markup=kb.as_markup())
     await callback.answer()
@@ -535,14 +542,18 @@ async def cb_campaign_pause(callback: CallbackQuery, session: AsyncSession) -> N
     campaign_id = int(callback.data.split(":")[2])
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
-    from app.db.engine import atomic_session
-    async with atomic_session() as write_session:
+    from app.db.engine import run_atomic
+    async def _pause_op(write_session: AsyncSession) -> bool:
         service_write = CampaignService(write_session)
         campaign = await service_write.campaign_repo.get_by_id(campaign_id)
         if not campaign or not user or campaign.user_id != user.id:
-            return await callback.answer("Ошибка доступа", show_alert=True)
+            return False
             
-        ok = await service_write.pause_campaign(campaign_id)
+        return await service_write.pause_campaign(campaign_id)
+        
+    ok = await run_atomic(_pause_op)
+    if not user:
+        return await callback.answer("Ошибка доступа", show_alert=True)
     await callback.answer(
         "⏸ Кампания приостановлена" if ok else "Не удалось приостановить.",
         show_alert=not ok,
@@ -556,20 +567,94 @@ async def cb_campaign_resume(callback: CallbackQuery, session: AsyncSession) -> 
     campaign_id = int(callback.data.split(":")[2])
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
-    from app.db.engine import atomic_session
-    async with atomic_session() as write_session:
+    from app.db.engine import run_atomic
+    async def _resume_op(write_session: AsyncSession) -> bool:
         service_write = CampaignService(write_session)
         campaign = await service_write.campaign_repo.get_by_id(campaign_id)
         if not campaign or not user or campaign.user_id != user.id:
-            return await callback.answer("Ошибка доступа", show_alert=True)
+            return False
             
-        ok = await service_write.resume_campaign(campaign_id)
+        return await service_write.resume_campaign(campaign_id)
+        
+    ok = await run_atomic(_resume_op)
+    if not user:
+        return await callback.answer("Ошибка доступа", show_alert=True)
     await callback.answer(
         "▶️ Кампания возобновлена" if ok else "Не удалось возобновить.",
         show_alert=not ok,
     )
     if ok:
         await cb_campaign_view(callback, session)
+
+
+@buyer_router.callback_query(F.data.startswith("campaign:decrease:"))
+async def cb_campaign_decrease(callback: CallbackQuery, session: AsyncSession, state: FSMContext) -> None:
+    campaign_id = int(callback.data.split(":")[2])
+    
+    user_service = UserService(session)
+    user = await user_service.get_by_telegram_id(callback.from_user.id)
+    if not user:
+        return await callback.answer("Ошибка доступа", show_alert=True)
+        
+    campaign_service = CampaignService(session)
+    campaign = await campaign_service.get_by_id(campaign_id)
+    if not campaign or campaign.user_id != user.id:
+        return await callback.answer("Кампания не найдена", show_alert=True)
+        
+    if campaign.target <= campaign.completed:
+        return await callback.answer("Цель уже достигнута", show_alert=True)
+
+    await state.update_data(campaign_id=campaign_id)
+    kb = InlineKeyboardBuilder()
+    kb.button(text="◀️ Отмена", callback_data=f"campaign:view:{campaign_id}")
+    
+    await callback.message.edit_text(
+        f"Текущая цель: <b>{campaign.target}</b>\n"
+        f"Уже выполнено: <b>{campaign.completed}</b>\n\n"
+        f"Введите новую цель (от {campaign.completed} до {campaign.target - 1}):",
+        reply_markup=kb.as_markup()
+    )
+    await state.set_state(CampaignDecrease.entering_target)
+    await callback.answer()
+
+@buyer_router.message(CampaignDecrease.entering_target)
+async def msg_campaign_decrease_target(message: Message, session: AsyncSession, state: FSMContext) -> None:
+    user_service = UserService(session)
+    user = await user_service.get_by_telegram_id(message.from_user.id)
+    if not user:
+        return
+
+    data = await state.get_data()
+    campaign_id = data.get("campaign_id")
+    if not campaign_id:
+        return await message.answer("Ошибка: ID кампании потерян.")
+
+    try:
+        new_target = int(message.text.strip())
+    except ValueError:
+        return await message.answer("Пожалуйста, введите целое число.")
+
+    campaign_service = CampaignService(session)
+    campaign = await campaign_service.get_by_id(campaign_id)
+    if not campaign or campaign.user_id != user.id:
+        await state.clear()
+        return await message.answer("Кампания не найдена.")
+
+    if new_target < campaign.completed or new_target >= campaign.target:
+        return await message.answer(
+            f"Новая цель должна быть от {campaign.completed} до {campaign.target - 1}. Введите еще раз:"
+        )
+
+    result = await campaign_service.decrease_target(campaign_id, user.id, new_target)
+    if result is None:
+        await message.answer("Не удалось уменьшить цель.")
+    else:
+        refunded = result.get("refunded", "0")
+        await message.answer(
+            f"✅ Цель уменьшена до {new_target}.\n"
+            f"Сумма возврата: {format_amount_plain(refunded)} USDT"
+        )
+    await state.clear()
 
 
 @buyer_router.callback_query(F.data.startswith("campaign:cancel:"))
@@ -603,13 +688,17 @@ async def cb_campaign_cancel_confirm(callback: CallbackQuery, session: AsyncSess
     user_service = UserService(session)
     user = await user_service.get_by_telegram_id(callback.from_user.id)
     try:
-        from app.db.engine import atomic_session
-        async with atomic_session() as write_session:
+        from app.db.engine import run_atomic
+        async def _cancel_op(write_session: AsyncSession):
             service = CampaignService(write_session)
-            result = await service.cancel_campaign(campaign_id)
-            if result is None:
-                await callback.answer("Не удалось отменить.", show_alert=True)
-                return
+            if not user:
+                return None
+            return await service.cancel_campaign(campaign_id, user_id=user.id)
+            
+        result = await run_atomic(_cancel_op)
+        if result is None:
+            await callback.answer("Не удалось отменить.", show_alert=True)
+            return
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         return
@@ -740,19 +829,24 @@ async def cb_campaign_increase_confirm(
     user = await user_service.get_by_telegram_id(callback.from_user.id)
 
     try:
-        from app.db.engine import atomic_session
-        async with atomic_session() as write_session:
+        from app.db.engine import run_atomic
+        
+        async def _increase_op(write_session: AsyncSession):
             campaign_service_write = CampaignService(write_session)
             ok = await campaign_service_write.increase_target(
                 campaign_id=campaign_id,
                 additional=extra,
             )
             if not ok:
-                await callback.message.edit_text("❌ Кампания недоступна для увеличения цели.")
-                await state.clear()
-                await callback.answer()
-                return
-            campaign = await campaign_service_write.get_by_id(campaign_id)
+                return None
+            return await campaign_service_write.get_by_id(campaign_id)
+            
+        campaign = await run_atomic(_increase_op)
+        if not campaign:
+            await callback.message.edit_text("❌ Кампания недоступна для увеличения цели.")
+            await state.clear()
+            await callback.answer()
+            return
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await state.clear()

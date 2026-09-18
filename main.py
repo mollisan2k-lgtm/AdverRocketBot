@@ -55,10 +55,7 @@ async def on_startup() -> None:
 
     # 2. (Removed create_all; Alembic is the only source of truth)
     # 3. Run migrations
-    try:
-        run_migrations()
-    except Exception as e:
-        logger.warning("Alembic migration skipped or failed: %s", e)
+    await run_migrations()
 
     # 4. Seed default settings
     await _seed_defaults()
@@ -134,18 +131,14 @@ async def _seed_defaults() -> None:
             "help": (
                 "❓ <b>Справка</b>\n\n"
                 "• /start — Главное меню\n"
-                "• /balance — Баланс\n"
-                "• /campaigns — Мои кампании\n"
-                "• /tasks — Мои задания\n"
-                "• /deposit — Пополнить\n"
-                "• /withdraw — Вывести\n"
-                "• /help — Справка\n\n"
+                "• Все остальные действия (Баланс, Кампании, Ввод/Вывод) доступны через кнопки в главном меню.\n\n"
                 "По вопросам: @{support}"
             ),
             "balance_info": (
                 "💰 <b>Ваш баланс</b>\n\n"
                 "Доступно: <code>{available}</code> USDT\n"
                 "В резерве: <code>{reserved}</code> USDT\n"
+                "В холде: <code>{held}</code> USDT\n"
                 "Итого: <code>{total}</code> USDT"
             ),
             "no_active_tasks": "📭 У вас нет активных заданий.",
@@ -215,14 +208,71 @@ class SessionMiddleware(BaseMiddleware):
             data["telegram_api"] = telegram_api
             try:
                 result = await handler(event, data)
-                await session.commit()
+                # DO NOT COMMIT here.
+                # Handlers MUST NOT mutate ORM objects and depend on middleware commit.
+                # All persistent writes must go exclusively through run_atomic().
                 return result
-            except Exception:
+            except Exception as e:
                 await session.rollback()
-                raise
+                logger.exception("Exception in update %s", event.update_id)
+                
+                try:
+                    from app.repositories.error_repo import SystemErrorRepository
+                    error_repo = SystemErrorRepository(session)
+                    await error_repo.log_error(
+                        error_type=type(e).__name__,
+                        message=str(e),
+                        severity="high"
+                    )
+                    await session.commit()
+                except Exception as db_e:
+                    logger.error("Failed to log error to DB: %s", db_e)
+
+                try:
+                    if event.message:
+                        await event.message.answer("⚠️ Произошла системная ошибка. Мы уже работаем над её устранением.")
+                    elif event.callback_query:
+                        await event.callback_query.message.answer("⚠️ Произошла системная ошибка. Мы уже работаем над её устранением.")
+                        await event.callback_query.answer()
+                except Exception:
+                    pass
+                return None
+
+
+class BlockedUserMiddleware(BaseMiddleware):
+    """Block processing if user is banned."""
+    
+    async def __call__(self, handler, event: Update, data: dict):
+        session = data.get("session")
+        if not session:
+            return await handler(event, data)
+
+        tg_user = None
+        if event.message:
+            tg_user = event.message.from_user
+        elif event.callback_query:
+            tg_user = event.callback_query.from_user
+
+        if tg_user:
+            from app.services.user_service import UserService
+            user_service = UserService(session)
+            user = await user_service.get_by_telegram_id(tg_user.id)
+            if user and user.is_blocked:
+                if event.message:
+                    await event.message.answer(
+                        f"⛔ Ваш аккаунт заблокирован.\nПричина: {user.block_reason or 'не указана'}"
+                    )
+                elif event.callback_query:
+                    await event.callback_query.answer(
+                        f"⛔ Аккаунт заблокирован: {user.block_reason or 'нет причины'}", show_alert=True
+                    )
+                return  # Drop the update
+        
+        return await handler(event, data)
 
 
 dp.update.outer_middleware(SessionMiddleware())
+dp.update.outer_middleware(BlockedUserMiddleware())
 
 
 # ── Register routers ─────────────────────────────────────────────────────────

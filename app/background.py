@@ -80,12 +80,11 @@ async def invoice_checker_loop(
                             )
                             if deposit and deposit.status == "pending":
                                 try:
-                                    from app.db.engine import atomic_session
-                                    async with atomic_session() as write_session:
+                                    from app.db.engine import run_atomic
+                                    async def _confirm_op(write_session: AsyncSession):
                                         write_deposit_service = DepositService(write_session, crypto_pay)
-                                        await write_deposit_service.confirm_payment(
-                                            deposit.id, inv,
-                                        )
+                                        await write_deposit_service.confirm_payment(deposit.id, inv)
+                                    await run_atomic(_confirm_op)
                                     logger.info(
                                         "Deposit %d confirmed via polling",
                                         deposit.id,
@@ -101,10 +100,11 @@ async def invoice_checker_loop(
                                 inv.invoice_id,
                             )
                             if deposit and deposit.status == "pending":
-                                from app.db.engine import atomic_session
-                                async with atomic_session() as write_session:
+                                from app.db.engine import run_atomic
+                                async def _expire_op(write_session: AsyncSession):
                                     write_deposit_service = DepositService(write_session, crypto_pay)
                                     await write_deposit_service.mark_expired(deposit.id)
+                                await run_atomic(_expire_op)
                                 logger.info(
                                     "Deposit %d marked expired", deposit.id,
                                 )
@@ -128,12 +128,13 @@ async def task_expiry_loop(interval: int = 60) -> None:
 
     while True:
         try:
-            from app.db.engine import atomic_session
-            async with atomic_session() as session:
+            from app.db.engine import run_atomic
+            async def _task_expire_op(session: AsyncSession) -> int:
                 task_service = TaskService(session)
-                expired = await task_service.expire_stale_tasks()
-                if expired > 0:
-                    logger.info("Expired %d stale tasks", expired)
+                return await task_service.expire_stale_tasks()
+            expired = await run_atomic(_task_expire_op)
+            if expired > 0:
+                logger.info("Expired %d stale tasks", expired)
         except Exception as e:
             logger.error("Task expiry error: %s", e, exc_info=True)
 
@@ -153,7 +154,7 @@ async def rights_recheck_loop(
 
     while True:
         try:
-            from app.db.engine import session_factory, atomic_session
+            from app.db.engine import session_factory, run_atomic
             async with session_factory() as session:
                 from app.repositories.group_repo import GroupRepository
                 group_repo = GroupRepository(session)
@@ -169,7 +170,7 @@ async def rights_recheck_loop(
                     check = await telegram_api.check_group_suitability(group.telegram_chat_id)
                     
                     # DB update INSIDE transaction
-                    async with atomic_session() as update_session:
+                    async def _recheck_op(update_session: AsyncSession):
                         update_repo = GroupRepository(update_session)
                         db_group = await update_repo.get_by_id(group.id)
                         if db_group:
@@ -190,6 +191,7 @@ async def rights_recheck_loop(
                                 db_group.member_count = check.member_count
 
                             db_group.updated_at = utc_now()
+                    await run_atomic(_recheck_op)
 
                     checked += 1
                     if not check.ok:
@@ -230,13 +232,14 @@ async def restriction_reconciliation_loop(
 
     while True:
         try:
-            from app.db.engine import atomic_session
+            from app.db.engine import run_atomic
             
             # 1. Claim restrictions that need reconciliation
-            async with atomic_session() as session:
+            async def _claim_op(session: AsyncSession):
                 from app.repositories.restriction_repo import RestrictionRepository
                 repo = RestrictionRepository(session)
-                claimed = await repo.claim_for_reconciliation(worker_token, lease_minutes=2)
+                return await repo.claim_for_reconciliation(worker_token, lease_minutes=2)
+            claimed = await run_atomic(_claim_op)
             
             if not claimed:
                 await asyncio.sleep(interval)
@@ -245,21 +248,21 @@ async def restriction_reconciliation_loop(
             # 2. Process each claimed record
             for r in claimed:
                 try:
-                    async with atomic_session() as process_session:
+                    async def _reconcile_op(process_session: AsyncSession):
                         from app.services.restriction_service import RestrictionService
                         r_service = RestrictionService(process_session, telegram_api)
-                        
-                        result = await r_service.reconcile_record(r.id, worker_token)
-                        if result.get("ok"):
-                            logger.debug(
-                                "Restriction %d reconciled (user=%d, group=%d)",
-                                r.id, r.user_telegram_id, r.group_id
-                            )
-                        else:
-                            logger.error(
-                                "Restriction %d failed reconciliation: %s",
-                                r.id, result.get("error")
-                            )
+                        return await r_service.reconcile_record(r.id, worker_token)
+                    result = await run_atomic(_reconcile_op)
+                    if result.get("ok"):
+                        logger.debug(
+                            "Restriction %d reconciled (user=%d, group=%d)",
+                            r.id, r.user_telegram_id, r.group_id
+                        )
+                    else:
+                        logger.error(
+                            "Restriction %d failed reconciliation: %s",
+                            r.id, result.get("error")
+                        )
                 except Exception as e:
                     logger.error("Error reconciling restriction %d: %s", r.id, e, exc_info=True)
 
@@ -285,13 +288,14 @@ async def withdrawal_processor_loop(
 
     while True:
         try:
-            from app.db.engine import atomic_session
+            from app.db.engine import run_atomic
             
             # 1. Claim withdrawals
-            async with atomic_session() as session:
+            async def _claim_wd_op(session: AsyncSession):
                 from app.repositories.withdrawal_repo import WithdrawalRepository
                 wd_repo = WithdrawalRepository(session)
-                claimed = await wd_repo.claim_for_processing(worker_token, lease_minutes=5)
+                return await wd_repo.claim_for_processing(worker_token, lease_minutes=5)
+            claimed = await run_atomic(_claim_wd_op)
             
             if not claimed:
                 await asyncio.sleep(interval)
@@ -300,41 +304,32 @@ async def withdrawal_processor_loop(
             # 2. Process each claimed withdrawal
             for w in claimed:
                 try:
-                    async with atomic_session() as process_session:
+                    async def _process_wd_op(process_session: AsyncSession):
                         wd_service = WithdrawalService(process_session, crypto_pay)
-                        
-                        # Look up user's telegram_id
                         from app.repositories.user_repo import UserRepository
                         user_repo = UserRepository(process_session)
                         user = await user_repo.get_by_id(w.user_id)
                         if not user:
-                            continue
-
-                        result = await wd_service.process_payout(
-                            w.id, user.telegram_id, worker_token=worker_token
+                            return None
+                        return await wd_service.process_payout(
+                            w.id, worker_token=worker_token
                         )
-                        if result.get("ok"):
-                            logger.info(
-                                "Withdrawal %d processed: transfer_id=%s",
-                                w.id, result.get("transfer_id"),
-                            )
-                        elif result.get("needs_reconciliation"):
-                            logger.warning(
-                                "Withdrawal %d needs reconciliation",
-                                w.id,
-                            )
-                        else:
-                            logger.error(
-                                "Withdrawal %d failed: %s",
-                                w.id, result.get("error"),
-                            )
+                    result = await run_atomic(_process_wd_op)
+                    if result is None:
+                        continue
+                    if result.get("ok"):
+                        logger.info("Withdrawal %d processed: transfer_id=%s", w.id, result.get("transfer_id"))
+                    elif result.get("needs_reconciliation"):
+                        logger.warning("Withdrawal %d needs reconciliation", w.id)
+                    else:
+                        logger.error("Withdrawal %d failed: %s", w.id, result.get("error"))
 
                 except Exception as e:
                     logger.error(
                         "Withdrawal %d processing error: %s",
                         w.id, e, exc_info=True,
                     )
-                    async with atomic_session() as err_session:
+                    async def _err_op(err_session: AsyncSession):
                         from app.repositories.error_repo import SystemErrorRepository
                         error_repo = SystemErrorRepository(err_session)
                         await error_repo.log_error(
@@ -343,6 +338,7 @@ async def withdrawal_processor_loop(
                             severity="high",
                             details_json=f'{{"withdrawal_id": {w.id}}}',
                         )
+                    await run_atomic(_err_op)
 
         except Exception as e:
             logger.error("Withdrawal processor error: %s", e, exc_info=True)
@@ -374,7 +370,7 @@ async def task_distribution_loop(
 
     while True:
         try:
-            from app.db.engine import session_factory, atomic_session
+            from app.db.engine import session_factory, run_atomic
             
             async with session_factory() as session:
                 from app.repositories.group_repo import GroupRepository
@@ -405,7 +401,8 @@ async def task_distribution_loop(
 
                     # Assign tasks atomically per user
                     try:
-                        async with atomic_session() as assign_session:
+                        async def _assign_dist_op(assign_session: AsyncSession) -> list[int]:
+                            nonlocal skipped
                             from app.services.task_service import TaskService, TaskDistributionError
                             from app.repositories.task_repo import TaskRepository
                             from app.repositories.settings_repo import SettingsRepository
@@ -422,9 +419,10 @@ async def task_distribution_loop(
                             active_tasks = await task_repo.get_active_by_user(user_tg_id)
                             active_count = len(active_tasks)
                             if active_count >= max_tasks_per_user:
-                                continue
+                                return []
 
                             user_distributed = 0
+                            assigned_tasks = []
 
                             for camp in campaigns:
                                 if user_distributed >= group.tasks_per_distribution:
@@ -443,7 +441,7 @@ async def task_distribution_loop(
                                         campaign_id=fresh_camp.id,
                                         group_id=group.id,
                                     )
-                                    distributed += 1
+                                    assigned_tasks.append(task.id)
                                     user_distributed += 1
                                     active_count += 1
                                     logger.debug(
@@ -459,6 +457,29 @@ async def task_distribution_loop(
                                         user_tg_id, fresh_camp.id, e,
                                     )
                                     continue
+                            return assigned_tasks
+                            
+                        assigned_ids = await run_atomic(_assign_dist_op)
+                        
+                        if assigned_ids:
+                            from app.services.restriction_service import RestrictionService
+                            from app.db.engine import session_factory
+                            
+                            original_perms = await telegram_api.get_member_permissions(
+                                group.telegram_chat_id, user_tg_id
+                            )
+                            
+                            async with session_factory() as temp_session:
+                                restriction_service = RestrictionService(temp_session, telegram_api)
+                                for t_id in assigned_ids:
+                                    res = await restriction_service.apply_restriction_for_task(
+                                        t_id, original_permissions=original_perms
+                                    )
+                                    if res["ok"]:
+                                        distributed += 1
+                                    else:
+                                        logger.warning("Auto-distribution restriction failed for task %d", t_id)
+                                        
                     except Exception as e:
                         logger.error("Distribution atomic session failed for user %d: %s", user_tg_id, e)
 

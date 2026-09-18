@@ -46,6 +46,7 @@ class WithdrawalService:
         self,
         user_id: int,
         amount: Decimal,
+        recipient_telegram_id: int,
         asset: str = "USDT",
     ) -> Withdrawal:
         """
@@ -68,8 +69,14 @@ class WithdrawalService:
         if amount > max_w:
             raise ValueError(f"Максимальная сумма вывода: {max_w} USDT")
 
+        # Check for existing live withdrawal
+        has_pending = await self.repo.has_pending(user_id=user_id)
+        if has_pending:
+            raise ValueError("У вас уже есть активная заявка на вывод. Дождитесь её обработки.")
+
         withdrawal = Withdrawal(
             user_id=user_id,
+            recipient_telegram_id=recipient_telegram_id,
             amount=to_db(amount),
             asset=asset,
             status="pending",
@@ -128,7 +135,6 @@ class WithdrawalService:
     async def process_payout(
         self,
         withdrawal_id: int,
-        user_telegram_id: int,
         worker_token: str | None = None,
     ) -> dict:
         """
@@ -182,7 +188,7 @@ class WithdrawalService:
         # 3. Execute transfer
         try:
             transfer = await self.crypto_pay.transfer(
-                user_id=user_telegram_id,
+                user_id=w.recipient_telegram_id,
                 asset=w.asset,
                 amount=str(amount),
                 spend_id=spend_id,

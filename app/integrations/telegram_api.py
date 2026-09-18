@@ -319,6 +319,17 @@ class TelegramAPIService:
                 "can_manage_topics": member.can_manage_topics,
             }
 
+    async def send_message(self, chat_id: int, text: str, parse_mode: str | None = "HTML") -> None:
+        """Send a message to a user or group."""
+        try:
+            await self.bot.send_message(
+                chat_id=chat_id,
+                text=text,
+                parse_mode=parse_mode,
+            )
+        except Exception as e:
+            logger.warning("Failed to send message to %d: %s", chat_id, e)
+
         # Regular member — no specific permissions stored
         return None
 

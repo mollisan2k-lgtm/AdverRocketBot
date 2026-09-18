@@ -345,6 +345,8 @@ class Withdrawal(Base):
     status = Column(String(20), nullable=False, default="pending")
     # Statuses: pending, approved, processing, completed, rejected, error
 
+    recipient_telegram_id = Column(BigInteger, nullable=True) # Added in Phase 9
+
     # Crypto Pay payout data
     spend_id = Column(String(255), nullable=True, unique=True)
     transfer_id = Column(BigInteger, nullable=True)
@@ -364,6 +366,12 @@ class Withdrawal(Base):
     __table_args__ = (
         Index("ix_withdrawals_status", "status"),
         Index("ix_withdrawals_user", "user_id"),
+        Index(
+            "uix_live_withdrawal_user",
+            "user_id",
+            unique=True,
+            sqlite_where=sa_text("status IN ('pending', 'approved', 'processing')"),
+        ),
     )
 
 
@@ -569,3 +577,29 @@ class IdempotencyKey(Base):
     result_json = Column(Text, nullable=True)
 
     created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+
+
+# ── Notifications ────────────────────────────────────────────────────────────
+
+class NotificationOutbox(Base):
+    """
+    Transactional outbox for Telegram notifications.
+    Written in the same transaction as state changes, sent async by background worker.
+    """
+    __tablename__ = "notification_outbox"
+
+    id = Column(Integer, primary_key=True, autoincrement=True)
+    telegram_id = Column(BigInteger, nullable=False, index=True)
+    text = Column(Text, nullable=False)
+    parse_mode = Column(String(50), nullable=True, default="HTML")
+    
+    # Status: pending, sent, error
+    status = Column(String(50), nullable=False, default="pending", index=True)
+    error_details = Column(Text, nullable=True)
+
+    created_at = Column(DateTime, nullable=False, default=datetime.utcnow)
+    processed_at = Column(DateTime, nullable=True)
+
+    __table_args__ = (
+        Index("ix_notification_status", "status"),
+    )

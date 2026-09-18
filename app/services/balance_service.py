@@ -96,12 +96,36 @@ class BalanceService:
         reason: str | None = None,
     ) -> BalanceSnapshot:
         """Apply balance change and record ledger entry."""
-        # Idempotency check
+        # Idempotency check FIRST
         if idempotency_key:
-            exists = await self.ledger_repo.idempotency_check(idempotency_key)
-            if exists:
-                raise DuplicateOperationError(
-                    f"Operation already executed: {idempotency_key}"
+            from sqlalchemy import select
+            from app.db.models import BalanceLedger
+            result = await self.session.execute(
+                select(BalanceLedger).where(BalanceLedger.idempotency_key == idempotency_key)
+            )
+            existing = result.scalar_one_or_none()
+            if existing:
+                if (
+                    existing.user_id != user_id or
+                    existing.operation_type != operation_type or
+                    from_db(existing.amount) != amount or
+                    existing.direction != direction
+                ):
+                    raise DuplicateOperationError(f"Duplicate operation with different parameters: {idempotency_key}")
+                
+                # Same parameters -> Idempotent success without mutation
+                e_avail = from_db(existing.available_after)
+                e_res = from_db(existing.reserved_after)
+                e_bal = from_db(existing.balance_after)
+                e_held = e_bal - e_avail - e_res
+                
+                return BalanceSnapshot(
+                    available=e_avail,
+                    reserved=e_res,
+                    held=e_held,
+                    amount=from_db(existing.amount),
+                    operation_type=existing.operation_type,
+                    ledger_id=existing.id,
                 )
 
         # Update user balance
@@ -170,6 +194,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         if not is_valid_amount(amount):
@@ -186,6 +211,8 @@ class BalanceService:
             new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="deposit",
             reference_id=deposit_id,
             idempotency_key=idempotency_key or f"deposit:{deposit_id}",
@@ -206,6 +233,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         if old_available < amount:
@@ -225,6 +253,8 @@ class BalanceService:
             new_reserved=new_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="campaign",
             reference_id=campaign_id,
             idempotency_key=idempotency_key or f"campaign_reserve:{campaign_id}",
@@ -246,6 +276,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         if old_reserved < amount:
@@ -264,6 +295,8 @@ class BalanceService:
             new_reserved=new_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="campaign",
             reference_id=campaign_id,
             idempotency_key=idempotency_key or f"task_spend:{task_id}",
@@ -285,6 +318,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         if old_reserved < amount:
@@ -304,6 +338,8 @@ class BalanceService:
             new_reserved=new_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="campaign",
             reference_id=campaign_id,
             idempotency_key=idempotency_key,
@@ -325,6 +361,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         new_available = old_available + amount
@@ -338,6 +375,8 @@ class BalanceService:
             new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="campaign",
             reference_id=campaign_id,
             idempotency_key=idempotency_key or f"seller_reward:{task_id}",
@@ -485,6 +524,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         amount = round_down(amount)
         new_available = old_available + amount
@@ -506,6 +546,8 @@ class BalanceService:
             new_reserved=old_reserved,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             idempotency_key=idempotency_key,
             reason=f"[Admin {admin_telegram_id}] {reason}",
         )
@@ -527,6 +569,7 @@ class BalanceService:
         user = await self._get_locked_user(user_id)
         old_available = from_db(user.available)
         old_reserved = from_db(user.reserved)
+        old_held = from_db(user.held_for_withdrawal)
 
         gross_amount = round_down(gross_amount)
         commission_amount = round_down(commission_amount)
@@ -537,22 +580,49 @@ class BalanceService:
                 f"Need {gross_amount} from reserve, have {old_reserved}"
             )
 
-        new_available = old_available + net_amount
-        new_reserved = old_reserved - gross_amount
-
-        return await self._apply(
+        # Step 1: Full refund to available
+        avail_after_refund = old_available + gross_amount
+        res_after_refund = old_reserved - gross_amount
+        
+        ik1 = f"{idempotency_key}:refund" if idempotency_key else None
+        
+        await self._apply(
             user_id=user_id,
             operation_type="refund",
-            amount=net_amount,
+            amount=gross_amount,
             direction="credit",
-            new_available=new_available,
-            new_reserved=new_reserved,
+            new_available=avail_after_refund,
+            new_reserved=res_after_refund,
             old_available=old_available,
             old_reserved=old_reserved,
+            new_held=old_held,
+            old_held=old_held,
             reference_type="campaign",
             reference_id=campaign_id,
-            idempotency_key=idempotency_key,
-            reason=f"Возврат {net_amount} (комиссия {commission_amount})",
+            idempotency_key=ik1,
+            reason=f"Полный возврат {gross_amount}",
+        )
+        
+        # Step 2: Deduct commission
+        new_available = avail_after_refund - commission_amount
+        
+        ik2 = f"{idempotency_key}:commission" if idempotency_key else None
+        
+        return await self._apply(
+            user_id=user_id,
+            operation_type="refund_commission",
+            amount=commission_amount,
+            direction="debit",
+            new_available=new_available,
+            new_reserved=res_after_refund,
+            old_available=avail_after_refund,
+            old_reserved=res_after_refund,
+            new_held=old_held,
+            old_held=old_held,
+            reference_type="campaign",
+            reference_id=campaign_id,
+            idempotency_key=ik2,
+            reason=f"Комиссия {commission_amount} за отмену",
         )
 
     # ── Query ────────────────────────────────────────────────────────────

@@ -44,9 +44,9 @@ class DepositService:
 
         Steps:
         1. Validate amount
-        2. Create DB row with status=pending
-        3. Call Crypto Pay createInvoice
-        4. Save invoice_id and pay_url
+        2. Create DB row with status=pending (atomic)
+        3. Call Crypto Pay createInvoice (outside transaction)
+        4. Save invoice_id and pay_url (atomic)
         """
         amount = round_down(amount)
         if not is_valid_amount(amount):
@@ -59,34 +59,62 @@ class DepositService:
         if amount < min_dep:
             raise ValueError(f"Минимальная сумма пополнения: {min_dep} USDT")
 
-        deposit = Deposit(
-            user_id=user_id,
-            amount=to_db(amount),
-            asset=asset,
-            status="pending",
-            created_at=utc_now(),
-            updated_at=utc_now(),
-        )
-        self.session.add(deposit)
-        await self.session.flush()
+        from app.db.engine import run_atomic
+        from sqlalchemy import update
 
-        # Create Crypto Pay invoice
+        # 1. Create DB record first
+        async def _create(session: AsyncSession) -> int:
+            deposit = Deposit(
+                user_id=user_id,
+                amount=to_db(amount),
+                asset=asset,
+                status="pending",
+                created_at=utc_now(),
+                updated_at=utc_now(),
+            )
+            session.add(deposit)
+            await session.flush()
+            return deposit.id
+
+        deposit_id = await run_atomic(_create)
+
+        # 2. Call Crypto Pay outside transaction
+        invoice_id = None
+        pay_url = None
+        error_msg = None
+
         if self.crypto_pay:
             try:
                 invoice = await self.crypto_pay.create_invoice(
                     amount=str(amount),
                     asset=asset,
-                    description=f"Пополнение баланса #{deposit.id}",
-                    payload=f"deposit:{deposit.id}",
+                    description=f"Пополнение баланса #{deposit_id}",
+                    payload=f"deposit:{deposit_id}",
                     expires_in=3600,  # 1 hour
                 )
-                deposit.invoice_id = invoice.invoice_id
-                deposit.pay_url = invoice.pay_url
+                invoice_id = invoice.invoice_id
+                pay_url = invoice.pay_url
             except Exception as e:
-                logger.error("Failed to create invoice for deposit %d: %s", deposit.id, e)
+                logger.error("Failed to create invoice for deposit %d: %s", deposit_id, e)
+                error_msg = str(e)
+
+        # 3. Update DB record
+        async def _update(session: AsyncSession) -> Deposit:
+            repo = DepositRepository(session)
+            deposit = await repo.get_by_id(deposit_id)
+            if error_msg:
                 deposit.status = "cancelled"
-                deposit.error_message = str(e) if hasattr(deposit, 'error_message') else None
-                raise
+                if hasattr(deposit, 'error_message'):
+                    deposit.error_message = error_msg
+            else:
+                deposit.invoice_id = invoice_id
+                deposit.pay_url = pay_url
+            return deposit
+
+        deposit = await run_atomic(_update)
+
+        if error_msg:
+            raise RuntimeError(f"Crypto Pay API error: {error_msg}")
 
         logger.info("Deposit created: id=%d user=%d amount=%s", deposit.id, user_id, amount)
         return deposit
@@ -109,6 +137,25 @@ class DepositService:
         if deposit.status != "pending":
             return False
 
+        if invoice_data:
+            if str(invoice_data.invoice_id) != str(deposit.invoice_id):
+                logger.error("Invoice ID mismatch for deposit %d: db=%s, inv=%s", deposit_id, deposit.invoice_id, invoice_data.invoice_id)
+                return False
+
+            if invoice_data.asset != deposit.asset:
+                logger.error("Asset mismatch for deposit %d: db=%s, inv=%s", deposit_id, deposit.asset, invoice_data.asset)
+                return False
+
+            db_amount = from_db(deposit.amount)
+            inv_amount = Decimal(str(invoice_data.amount))
+            if inv_amount < db_amount:
+                logger.error("Amount mismatch for deposit %d: db=%s, inv=%s", deposit_id, db_amount, inv_amount)
+                return False
+
+            if invoice_data.status != "paid":
+                logger.warning("Invoice not paid for deposit %d: status=%s", deposit_id, invoice_data.status)
+                return False
+
         # Update deposit
         deposit.status = "paid"
         deposit.paid_at = utc_now()
@@ -119,7 +166,7 @@ class DepositService:
             deposit.external_data_json = json.dumps({
                 "invoice_id": invoice_data.invoice_id,
                 "paid_at": invoice_data.paid_at,
-                "amount": invoice_data.amount,
+                "amount": str(invoice_data.amount),
             })
 
         # Credit balance

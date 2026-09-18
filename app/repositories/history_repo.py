@@ -49,24 +49,33 @@ class HistoryRepository(BaseRepository[TargetUserHistory]):
         Record task completion and set next_available_at.
         Creates or updates the history record (upsert pattern).
         """
-        record = await self.get_record(user_telegram_id, target_chat_id)
+        from sqlalchemy.dialects.sqlite import insert
+
         now = utc_now()
         next_at = minutes_from_now(cooldown_minutes)
 
-        if record is None:
-            return await self.create(
-                user_telegram_id=user_telegram_id,
-                target_chat_id=target_chat_id,
-                last_completed_at=now,
-                next_available_at=next_at,
-                completion_count=1,
-            )
+        stmt = insert(TargetUserHistory).values(
+            user_telegram_id=user_telegram_id,
+            target_chat_id=target_chat_id,
+            last_completed_at=now,
+            next_available_at=next_at,
+            completion_count=1,
+            created_at=now,
+            updated_at=now,
+        )
 
-        record.last_completed_at = now
-        record.next_available_at = next_at
-        record.completion_count += 1
-        await self.session.flush()
-        return record
+        upsert_stmt = stmt.on_conflict_do_update(
+            index_elements=["user_telegram_id", "target_chat_id"],
+            set_=dict(
+                last_completed_at=stmt.excluded.last_completed_at,
+                next_available_at=stmt.excluded.next_available_at,
+                completion_count=TargetUserHistory.completion_count + 1,
+                updated_at=stmt.excluded.updated_at,
+            )
+        ).returning(TargetUserHistory)
+
+        result = await self.session.execute(upsert_stmt)
+        return result.scalar_one()
 
     async def get_completion_count(
         self, user_telegram_id: int, target_chat_id: int

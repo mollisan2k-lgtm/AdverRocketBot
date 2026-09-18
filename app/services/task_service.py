@@ -96,6 +96,22 @@ class TaskService:
         if group.status != "approved":
             raise TaskDistributionError("Группа не одобрена.")
 
+        # 2. Check campaign total capacity (completed + live)
+        live_count = await self.task_repo.count_active_for_campaign(campaign_id)
+        if campaign.completed + live_count >= campaign.target:
+            raise TaskDistributionError("Все доступные места уже забронированы или выполнены.")
+
+        # 3. Check user live task limit
+        from app.repositories.settings_repo import SettingsRepository
+        settings_repo = SettingsRepository(self.session)
+        max_tasks_str = await settings_repo.get_value("max_tasks_per_user")
+        max_tasks = int(max_tasks_str) if max_tasks_str else 3
+        
+        # count_active_by_user now includes active + pending_restriction
+        user_tasks = await self.task_repo.get_active_by_user(user_telegram_id)
+        if len(user_tasks) >= max_tasks:
+            raise TaskDistributionError(f"У вас уже максимальное количество активных заданий ({max_tasks}).")
+
         # 4. Check repeat restriction
         is_available = await self.history_repo.is_available(
             user_telegram_id=user_telegram_id,
@@ -176,16 +192,25 @@ class TaskService:
             raise TaskVerificationError("Campaign not found")
 
         if campaign.completed >= campaign.target or campaign.status not in ("active", "paused"):
-            task.status = "cancelled"
-            task.updated_at = utc_now()
+            await self.session.execute(
+                update(CampaignTask)
+                .where(CampaignTask.id == task.id)
+                .values(status="cancelled", updated_at=utc_now())
+            )
             raise TaskVerificationError("Кампания завершена — все места заняты.")
 
-        task.status = "completed"
-        task.completed_at = utc_now()
-        task.updated_at = utc_now()
+        claimed = await self.task_repo.complete_task(task.id)
+        if not claimed:
+            raise TaskVerificationError("Задание уже обработано или неактивно.")
 
+        await self.session.execute(
+            update(Campaign)
+            .where(Campaign.id == campaign.id)
+            .values(completed=Campaign.completed + 1, updated_at=utc_now())
+        )
+        
+        # In-memory update for the response dict
         campaign.completed += 1
-        campaign.updated_at = utc_now()
 
         # 5. Financial operations
 

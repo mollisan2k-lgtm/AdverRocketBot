@@ -29,9 +29,11 @@ def get_alembic_config() -> AlembicConfig:
     return cfg
 
 
-def run_migrations() -> None:
+import asyncio
+
+async def run_migrations() -> None:
     """Apply all pending migrations. Called at startup BEFORE bot polling."""
     logger.info("Checking for pending database migrations...")
     cfg = get_alembic_config()
-    command.upgrade(cfg, "head")
+    await asyncio.to_thread(command.upgrade, cfg, "head")
     logger.info("Database migrations completed.")

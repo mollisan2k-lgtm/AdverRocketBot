@@ -116,20 +116,30 @@ class CampaignService:
 
     # ── State transitions ────────────────────────────────────────────────
 
-    async def pause_campaign(self, campaign_id: int) -> bool:
+    async def pause_campaign(self, campaign_id: int, user_id: int | None = None) -> bool:
         """
         Pause: active -> paused.
         Active tasks remain and CAN be completed while paused.
         No new tasks will be distributed.
         """
+        if user_id is not None:
+            c = await self.campaign_repo.get_by_id(campaign_id)
+            if not c or c.user_id != user_id:
+                return False
+
         return await self.campaign_repo.conditional_update_status(
             campaign_id=campaign_id,
             allowed_from=("active",),
             new_status="paused",
         )
 
-    async def resume_campaign(self, campaign_id: int) -> bool:
+    async def resume_campaign(self, campaign_id: int, user_id: int | None = None) -> bool:
         """Resume: paused -> active."""
+        if user_id is not None:
+            c = await self.campaign_repo.get_by_id(campaign_id)
+            if not c or c.user_id != user_id:
+                return False
+
         return await self.campaign_repo.conditional_update_status(
             campaign_id=campaign_id,
             allowed_from=("paused",),
@@ -141,6 +151,7 @@ class CampaignService:
         campaign_id: int,
         cancelled_by: str = "user",
         commission_percent: Decimal | None = None,
+        user_id: int | None = None,
     ) -> dict[str, Any] | None:
         """
         Cancel: active/paused -> cancelled.
@@ -153,6 +164,13 @@ class CampaignService:
 
         Returns refund details or None if transition failed.
         """
+        campaign = await self.campaign_repo.get_by_id(campaign_id)
+        if not campaign:
+            return None
+            
+        if user_id is not None and campaign.user_id != user_id:
+            return None
+
         # 1. Transition
         ok = await self.campaign_repo.conditional_update_status(
             campaign_id=campaign_id,
@@ -161,8 +179,6 @@ class CampaignService:
         )
         if not ok:
             return None
-
-        campaign = await self.campaign_repo.get_by_id(campaign_id)
         if not campaign:
             return None
 
@@ -322,9 +338,12 @@ class CampaignService:
             idempotency_key=f"campaign_increase:{campaign_id}:{campaign.target + additional}",
         )
 
-        # Update target
-        campaign.target += additional
-        campaign.updated_at = utc_now()
+        # Update target atomically
+        await self.session.execute(
+            update(Campaign)
+            .where(Campaign.id == campaign_id, Campaign.status.in_(("active", "paused")))
+            .values(target=Campaign.target + additional, updated_at=utc_now())
+        )
 
         logger.info(
             "Campaign %d target increased by %d (new=%d)",
@@ -337,6 +356,7 @@ class CampaignService:
         campaign_id: int,
         new_target: int,
         commission_percent: Decimal | None = None,
+        user_id: int | None = None,
     ) -> dict[str, Any] | None:
         """
         Decrease campaign target (active/paused).
@@ -347,6 +367,9 @@ class CampaignService:
         """
         campaign = await self.campaign_repo.get_by_id(campaign_id)
         if not campaign or campaign.status not in ("active", "paused"):
+            return None
+            
+        if user_id is not None and campaign.user_id != user_id:
             return None
 
         if new_target < campaign.completed:
@@ -399,9 +422,12 @@ class CampaignService:
             idempotency_key=f"refund_balance:decrease:{campaign_id}:{new_target}",
         )
 
-        # Update target
-        campaign.target = new_target
-        campaign.updated_at = utc_now()
+        # Update target atomically
+        await self.session.execute(
+            update(Campaign)
+            .where(Campaign.id == campaign_id, Campaign.status.in_(("active", "paused")))
+            .values(target=new_target, updated_at=utc_now())
+        )
 
         # Cancel excess active tasks if any
         active_count = await self.task_repo.count_active_for_campaign(campaign_id)
@@ -451,10 +477,15 @@ class CampaignService:
             idempotency_key=f"refund_balance:decrease:{campaign.id}:{new_target}",
         )
 
-        campaign.target = new_target
-        campaign.status = "completed"
-        campaign.completed_at = utc_now()
-        campaign.updated_at = utc_now()
+        ok = await self.campaign_repo.conditional_update_status(
+            campaign_id=campaign.id,
+            allowed_from=("active", "paused"),
+            new_status="completed",
+            target=new_target,
+            updated_at=utc_now()
+        )
+        if not ok:
+            return {"refunded": "0.00", "commission": "0.00", "completed": False}
 
         # Cancel all remaining active tasks
         await self.task_repo.cancel_active_tasks_for_campaign(campaign.id)

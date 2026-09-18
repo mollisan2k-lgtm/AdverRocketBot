@@ -20,7 +20,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             select(CampaignTask)
             .where(
                 CampaignTask.user_telegram_id == user_telegram_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
             .order_by(CampaignTask.created_at.desc())
         )
@@ -32,7 +32,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             select(CampaignTask)
             .where(
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalars().all()
@@ -43,7 +43,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             select(CampaignTask)
             .where(
                 CampaignTask.group_id == group_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalars().all()
@@ -57,7 +57,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             .where(
                 CampaignTask.user_telegram_id == user_telegram_id,
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalar_one() > 0
@@ -71,7 +71,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             .where(
                 CampaignTask.user_telegram_id == user_telegram_id,
                 CampaignTask.target_chat_id == target_chat_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalar_one() > 0
@@ -123,24 +123,24 @@ class TaskRepository(BaseRepository[CampaignTask]):
         return result.rowcount
 
     async def cancel_by_campaign(self, campaign_id: int) -> int:
-        """Cancel all active tasks for a campaign. Returns count."""
+        """Cancel all live tasks for a campaign. Returns count."""
         result = await self.session.execute(
             update(CampaignTask)
             .where(
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
             .values(status="cancelled")
         )
         return result.rowcount
 
     async def count_active_by_campaign(self, campaign_id: int) -> int:
-        """Count active tasks for a campaign."""
+        """Count live tasks for a campaign."""
         result = await self.session.execute(
             select(func.count(CampaignTask.id))
             .where(
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalar_one()
@@ -174,7 +174,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             )
             .where(
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
             .distinct()
         )
@@ -184,15 +184,15 @@ class TaskRepository(BaseRepository[CampaignTask]):
         self, campaign_id: int, excess: int
     ) -> int:
         """
-        Cancel N oldest active tasks for a campaign (when target decreases).
+        Cancel N oldest live tasks for a campaign (when target decreases).
         Returns actual cancelled count.
         """
-        # Get IDs of oldest active tasks to cancel
+        # Get IDs of oldest live tasks to cancel
         result = await self.session.execute(
             select(CampaignTask.id)
             .where(
                 CampaignTask.campaign_id == campaign_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
             .order_by(CampaignTask.created_at)
             .limit(excess)
@@ -217,7 +217,7 @@ class TaskRepository(BaseRepository[CampaignTask]):
             .where(
                 CampaignTask.group_id == group_id,
                 CampaignTask.user_telegram_id == user_telegram_id,
-                CampaignTask.status == "active",
+                CampaignTask.status.in_(["active", "pending_restriction"]),
             )
         )
         return result.scalar_one()

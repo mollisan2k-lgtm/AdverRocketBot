@@ -104,7 +104,7 @@ class RestrictionRepository(BaseRepository[UserRestriction]):
     async def claim_for_reconciliation(self, worker_token: str, lease_minutes: int = 5) -> Sequence[UserRestriction]:
         """
         Claim records where desired_state != actual_state for background processing.
-        MUST be called inside atomic_session.
+        MUST be called inside run_atomic.
         """
         now = utc_now()
         lease_expiry = now + timedelta(minutes=lease_minutes)

@@ -335,10 +335,11 @@ async def cb_task_check(
     )
 
     try:
-        from app.db.engine import atomic_session
-        async with atomic_session() as write_session:
+        from app.db.engine import run_atomic
+        
+        async def _verify_op(write_session: AsyncSession):
             task_service_write = TaskService(write_session)
-            result = await task_service_write.verify_and_complete(task_id, is_subscribed)
+            res = await task_service_write.verify_and_complete(task_id, is_subscribed)
             
             # Set desired restriction state to OFF, let worker handle actual Telegram call
             from app.repositories.restriction_repo import RestrictionRepository
@@ -348,7 +349,10 @@ async def cb_task_check(
                 user_telegram_id=callback.from_user.id,
                 desired_state="OFF"
             )
-            # Transaction commits here
+            return res
+            
+        result = await run_atomic(_verify_op)
+        # Transaction commits here
     except Exception as e:
         await callback.answer(str(e), show_alert=True)
         return
@@ -468,7 +472,11 @@ async def cb_withdraw_confirm(
 
     wd_service = WithdrawalService(session, crypto_pay)
     try:
-        withdrawal = await wd_service.request_withdrawal(user.id, amount)
+        withdrawal = await wd_service.request_withdrawal(
+            user_id=user.id,
+            amount=amount,
+            recipient_telegram_id=user.telegram_id,
+        )
     except Exception as e:
         await callback.message.edit_text(f"❌ Ошибка: {e}")
         await state.clear()
@@ -688,24 +696,23 @@ async def on_new_member(
     original_perms = await telegram_api.get_member_permissions(chat_id, user_tg_id)
 
     # 3. Transactional task assignment and restriction recording
-    from app.db.engine import atomic_session
+    from app.db.engine import run_atomic
     from app.repositories.restriction_repo import RestrictionRepository
     from app.services.campaign_service import CampaignService
     from app.services.task_service import TaskService, TaskDistributionError
 
-    task_id = None
-    async with atomic_session() as write_session:
+    async def _assign_op(write_session: AsyncSession) -> int | None:
         campaign_service = CampaignService(write_session)
         task_service = TaskService(write_session)
         restriction_repo = RestrictionRepository(write_session)
 
         campaigns = await campaign_service.get_distributable_campaigns(group.category_id)
-        task = None
+        assigned_task = None
         for campaign in campaigns:
             if campaign.completed >= campaign.target:
                 continue
             try:
-                task = await task_service.assign_task(
+                assigned_task = await task_service.assign_task(
                     user_telegram_id=user_tg_id,
                     campaign_id=campaign.id,
                     group_id=group.id,
@@ -718,7 +725,7 @@ async def on_new_member(
                 )
                 continue
 
-        if task:
+        if assigned_task:
             # We got a task, so we want to restrict the user.
             # Record desired_state="ON", actual_state="OFF"
             await restriction_repo.add_restriction(
@@ -726,11 +733,10 @@ async def on_new_member(
                 user_telegram_id=user_tg_id,
                 original_permissions=original_perms,
             )
-            task_id = task.id
-        else:
-            # No task available.
-            # Do NOT restrict the user, just return.
-            pass
+            return assigned_task.id
+        return None
+
+    task_id = await run_atomic(_assign_op)
 
     if task_id:
         logger.info(

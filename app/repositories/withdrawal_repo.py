@@ -108,7 +108,7 @@ class WithdrawalRepository(BaseRepository[Withdrawal]):
     async def claim_for_processing(self, worker_token: str, lease_minutes: int = 5) -> Sequence[Withdrawal]:
         """
         Claim unassigned or expired-lease withdrawals for processing.
-        MUST be called inside atomic_session.
+        MUST be called inside run_atomic.
         """
         now = utc_now()
         lease_expiry = now + timedelta(minutes=lease_minutes)

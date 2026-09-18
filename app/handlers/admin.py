@@ -379,6 +379,8 @@ async def cb_admin_categories(callback: CallbackQuery, session: AsyncSession) ->
     categories = await cat_service.get_all()
 
     text_parts = ["📂 <b>Категории</b>\n"]
+    kb = InlineKeyboardBuilder()
+
     for c in categories:
         status = {"active": "✅", "disabled": "⛔", "archived": "📦"}.get(c.status, "?")
         text_parts.append(
@@ -386,8 +388,8 @@ async def cb_admin_categories(callback: CallbackQuery, session: AsyncSession) ->
             f"   Покупка: {format_amount_plain(from_db(c.buyer_price))} · "
             f"Выплата: {format_amount_plain(from_db(c.seller_payout))}"
         )
+        kb.button(text=f"✏️ {c.name}", callback_data=f"admin:cat_edit:{c.id}")
 
-    kb = InlineKeyboardBuilder()
     kb.button(text="➕ Создать", callback_data="admin:cat_create")
     kb.button(text="◀️ Назад", callback_data="admin:menu")
     kb.adjust(1)
@@ -498,6 +500,64 @@ async def msg_cat_seller_payout(
         f"Покупка: {format_amount_plain(buyer_price)} USDT\n"
         f"Выплата: {format_amount_plain(payout)} USDT"
     )
+
+@admin_router.callback_query(F.data.startswith("admin:cat_edit:"))
+async def cb_admin_cat_edit(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Show category edit options."""
+    if not _is_admin(callback.from_user.id):
+        return
+
+    cat_id = int(callback.data.split(":")[2])
+    cat_service = CategoryService(session)
+    c = await cat_service.get_by_id(cat_id)
+    if not c:
+        await callback.answer("Категория не найдена", show_alert=True)
+        return
+
+    text = (
+        f"📂 <b>{c.name}</b>\n\n"
+        f"Статус: {c.status}\n"
+        f"Покупка: {format_amount_plain(from_db(c.buyer_price))} USDT\n"
+        f"Выплата: {format_amount_plain(from_db(c.seller_payout))} USDT\n"
+    )
+
+    kb = InlineKeyboardBuilder()
+    if c.status == "active":
+        kb.button(text="⛔ Отключить", callback_data=f"admin:cat_status:{c.id}:disabled")
+    elif c.status == "disabled":
+        kb.button(text="✅ Включить", callback_data=f"admin:cat_status:{c.id}:active")
+    
+    kb.button(text="◀️ Назад", callback_data="admin:categories")
+    kb.adjust(1)
+
+    await callback.message.edit_text(text, reply_markup=kb.as_markup())
+    await callback.answer()
+
+@admin_router.callback_query(F.data.startswith("admin:cat_status:"))
+async def cb_admin_cat_status(callback: CallbackQuery, session: AsyncSession) -> None:
+    """Change category status."""
+    if not _is_admin(callback.from_user.id):
+        return
+
+    parts = callback.data.split(":")
+    cat_id = int(parts[2])
+    new_status = parts[3]
+
+    from sqlalchemy import update
+    from app.db.models import Category
+
+    await session.execute(
+        update(Category)
+        .where(Category.id == cat_id)
+        .values(status=new_status)
+    )
+    await session.commit()
+    await callback.answer(f"Статус изменен на {new_status}")
+    
+    # Refresh category view
+    new_callback_data = f"admin:cat_edit:{cat_id}"
+    callback_mock = callback.model_copy(update={"data": new_callback_data})
+    await cb_admin_cat_edit(callback_mock, session)
     await state.clear()
 
 
@@ -811,6 +871,40 @@ async def msg_admin_user_query(message: Message, session: AsyncSession, state: F
 
     await message.answer(text, reply_markup=kb.as_markup())
     await state.clear()
+
+
+# ── Force complete campaign ────────────────────────────────────────────────
+
+@admin_router.message(Command("force_complete"))
+async def cmd_admin_force_complete(message: Message, session: AsyncSession) -> None:
+    """Force complete a campaign."""
+    if not _is_admin(message.from_user.id):
+        return
+
+    parts = message.text.split()
+    if len(parts) != 2:
+        await message.answer("Использование: /force_complete <campaign_id>")
+        return
+
+    try:
+        campaign_id = int(parts[1])
+    except ValueError:
+        await message.answer("Неверный ID кампании.")
+        return
+
+    campaign_service = CampaignService(session)
+    result = await campaign_service.admin_force_complete(campaign_id)
+    
+    if result is None:
+        await message.answer("Кампания не найдена или не может быть завершена.")
+        return
+        
+    refunded = result.get("refunded", "0")
+    await message.answer(
+        f"✅ Кампания #{campaign_id} принудительно завершена.\n"
+        f"Сумма возврата: {format_amount_plain(refunded)} USDT"
+    )
+
 
 @admin_router.callback_query(F.data.startswith("admin:block:"))
 async def cb_admin_block_user(callback: CallbackQuery, session: AsyncSession) -> None:

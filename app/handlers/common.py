@@ -146,6 +146,7 @@ async def cb_balance_show(callback: CallbackQuery, session: AsyncSession) -> Non
     text = tpl.format(
         available=format_amount_plain(available),
         reserved=format_amount_plain(reserved),
+        held=format_amount_plain(held),
         total=format_amount_plain(total),
     )
 

@@ -68,33 +68,37 @@ class LedgerRepository(BaseRepository[BalanceLedger]):
         Record a financial ledger entry.
         This is the ONLY way to create ledger entries.
         """
-        # Idempotency guard
-        if idempotency_key:
-            exists = await self.idempotency_check(idempotency_key)
-            if exists:
-                # Return existing entry
-                result = await self.session.execute(
-                    select(BalanceLedger)
-                    .where(BalanceLedger.idempotency_key == idempotency_key)
-                )
-                return result.scalar_one()
+        from sqlalchemy.dialects.sqlite import insert
 
-        return await self.create(
-            user_id=user_id,
-            operation_type=operation_type,
-            amount=amount,
-            direction=direction,
-            balance_before=balance_before,
-            balance_after=balance_after,
-            available_before=available_before,
-            available_after=available_after,
-            reserved_before=reserved_before,
-            reserved_after=reserved_after,
-            reference_type=reference_type,
-            reference_id=reference_id,
-            idempotency_key=idempotency_key,
-            reason=reason,
-        )
+        values = {
+            "user_id": user_id,
+            "operation_type": operation_type,
+            "amount": amount,
+            "direction": direction,
+            "balance_before": balance_before,
+            "balance_after": balance_after,
+            "available_before": available_before,
+            "available_after": available_after,
+            "reserved_before": reserved_before,
+            "reserved_after": reserved_after,
+            "reference_type": reference_type,
+            "reference_id": reference_id,
+            "idempotency_key": idempotency_key,
+            "reason": reason,
+        }
+
+        stmt = insert(BalanceLedger).values(**values)
+        if idempotency_key:
+            stmt = stmt.on_conflict_do_nothing(index_elements=["idempotency_key"])
+        
+        stmt = stmt.returning(BalanceLedger)
+        result = await self.session.execute(stmt)
+        inserted = result.scalar_one_or_none()
+        
+        if inserted is None and idempotency_key:
+            raise ValueError(f"Idempotency conflict during insert: {idempotency_key}")
+            
+        return inserted
 
     async def count_by_user(self, user_id: int) -> int:
         """Count total ledger entries for a user."""
