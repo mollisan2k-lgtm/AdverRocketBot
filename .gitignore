@@ -149,8 +149,11 @@ activemq-data/
 
 # Environments
 .env
+.env.*
+!.env.example
 .envrc
 .venv
+.venv*
 env/
 venv/
 ENV/
@@ -216,3 +219,18 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ===== AdverRocketBot =====
+# SQLite database & WAL files
+*.db
+*.db-wal
+*.db-shm
+
+# Persistent data (Bothost /app/data/)
+/data/
+
+# Database backups
+/backups/
+
+# Agents config
+.agents/
